@@ -1,14 +1,14 @@
-# LAB-2: 内存管理初步
+# LAB-3: 中断异常初步
 
 **前言**
 
-在lab-1中, 我们学习了机器启动流程、UART设备驱动、格式化输出和自旋锁
+前两个实验其实留了两个坑没有填:
 
-完成lab-1后, OS内核已经可以进入main函数并掌控UART资源做一些输出了
+- lab-1中实现了UART的输入输出函数, 但是printf只用到输出函数, 输入函数没有发挥作用
 
-在lab-2中, 我们要开始认识和管理“程序除了CPU外最常访问的共享资源——内存”
+- lab-2中内核页表映射了CLINT和PLIC这两种设备, 还没有使用过它们的能力
 
-内存管理的实现不是一步到位的, lab-2主要关注物理内存和内核态虚拟内存, 剩余部分将在后面的实验逐渐完善
+在本次实验, 我们会填上这两个小坑——为OS内核引入初级的“中断+异常”的识别和处理能力
 
 ## 代码组织结构
 ```
@@ -17,8 +17,8 @@ ECNU-OSLAB-2025-TASK
 ├── .vscode        配置了可视化调试环境
 ├── registers.xml  配置了可视化调试环境
 ├── common.mk      Makefile中一些工具链的定义
-├── Makefile       编译运行整个项目 (CHANGE, 增加trap和mem目录作为target)
-├── kernel.ld      定义了内核程序在链接时的布局 (CHANGE, 增加一些关键位置的标记)
+├── Makefile       编译运行整个项目
+├── kernel.ld      定义了内核程序在链接时的布局
 ├── pictures       README使用的图片目录 (CHANGE, 日常更新)
 ├── README.md      实验指导书 (CHANGE, 日常更新)
 └── src            源码
@@ -26,10 +26,10 @@ ECNU-OSLAB-2025-TASK
         ├── arch   RISC-V相关
         │   ├── method.h
         │   ├── mod.h
-        │   └── type.h
+        │   └── type.h (CHANGE, 新增一些RISC-V中断相关宏定义)
         ├── boot   机器启动
         │   ├── entry.S
-        │   └── start.c
+        │   └── start.c (TODO, 在M-mode多做一些事情再进入S-mode)
         ├── lock   锁机制
         │   ├── spinlock.c
         │   ├── method.h
@@ -39,21 +39,25 @@ ECNU-OSLAB-2025-TASK
         │   ├── cpu.c
         │   ├── print.c
         │   ├── uart.c
-        │   ├── utils.c (NEW, 工具函数)
-        │   ├── method.h (CHANGE, utils.c的函数声明)
+        │   ├── utils.c
+        │   ├── method.h
         │   ├── mod.h
         │   └── type.h
         ├── mem    内存模块
-        │   ├── pmem.c (TODO, 物理内存管理)
-        │   ├── kvm.c (TODO, 内核态虚拟内存管理)
-        │   ├── method.h (NEW)
-        │   ├── mod.h (NEW)
-        │   └── type.h (NEW)
+        │   ├── pmem.c
+        │   ├── kvm.c
+        │   ├── method.h
+        │   ├── mod.h
+        │   └── type.h
         ├── trap   陷阱模块
-        │   ├── method.h (NEW)
-        │   ├── mod.h (NEW)
-        │   └── type.h (NEW, 增加CLINT和PLIC寄存器定义)
-        └── main.c (TODO)
+        │   ├── plic.c (NEW, 请阅读和理解这部分)
+        │   ├── timer.c (TODO, 时钟中断和计时器相关操作)
+        │   ├── trap_kernel.c (TODO, 内核态trap处理的核心逻辑)
+        │   ├── trap.S (NEW, 很重要, 请完全理解这部分)
+        │   ├── method.h (CHANGE)
+        │   ├── mod.h
+        │   └── type.h (CHANGE)
+        └── main.c (TODO, 更多的初始化)
 ```
 **标记说明**
 
@@ -63,439 +67,194 @@ ECNU-OSLAB-2025-TASK
 
 **TODO**: 你需要实现新功能 / 你需要完善旧功能
 
-## 第一阶段: 物理内存
+## 初步认识中断和异常
 
-首先需要关注的文件是 **kernel.ld** 文件, 它规定了内核文件 **kernel-qemu.elf** 在载入内存时的布局
+中断、异常、陷入等概念在不同体系结构下(ARM, x86, MIPS...)定义有一些区别, 这里只讨论RISC-V的定义
 
-物理内存按照地址空间划分为三个部分：
+RISC-V用陷阱(trap)的概念统筹二者: 陷阱可以分为中断(interrupt)和异常(exception)两种类型
 
-- **0x80000000 ~ KERNEL_DATA** 存放了 **kernel-qemu.elf的代码**
+**共同点:**
 
-- **KERNEL_DATA ~ ALLOC_BEGIN** 存放了 **kernel-qemu.elf的数据**
+- 中断和异常都是对正常执行流的一种打断, OS内核临时处理一个紧急的事情, 随后返回原来的执行流
 
-- **ALLOC_BEGIN ~ ALLOC_END** 属于 **未使用的可分配的物理页**
+- 中断和异常都涉及特权级的陷入和返回, 例如U-mode陷入S-mode再返回U-mode (也可以是同级的)
 
-如果你想深入了解可执行文件(ELF)的布局信息, 可以自行查阅资料, 在lab-9中我们会再提
+**不同点:**
 
-前两个区域的物理页会一直被内核占用, 不会纳入动态分配和回收的范围, 需要管理的只有第三个区域的物理页
+- 中断是同步过程, 假设发生中断的指令地址为PC, 中断处理完成后, 会继续执行PC+4对应的指令 (下一条指令)
 
-首先介绍物理内存管理的基本原理: **4KB物理页切分 + 空闲链表组织**
+- 异常是异步过程, 假设发生异常的指令地址为PC, 异常处理完成后, 会重新执行PC对应的指令
 
-**ALLOC_BEGIN ~ ALLOC_END** 这块物理空间被切分为N个4KB物理页(不会有剩余)
+**从程序的角度来看:**
 
-此外, 考虑到内核与用户空间的强制隔离, 我们设置了两个`alloc_region`, 基于**KENREL_PAGE**进行边界划分
+- 遇到**中断**往往是意料之内的事, 甚至是期待发生的事 (需要串口中断读取字符, 需要时钟中断指导调度)
 
-`kernel_region` 记录了内核空间的空闲物理页情况, `user_region` 记录了用户空间的空闲物理页情况
+- 遇到**异常**往往是因为代码本身有问题 (除了ecall和page fault这两种可控的情况)
 
-`alloc_region` 描述了一组空闲页链表, 包括起止位置、空闲页面数量、链表头节点、保证一致性的锁
+**具体来说, RISC-V定义了以下中断和异常类型:**
 
-下面的图片显示了物理页的申请和释放在链表上是如何体现的
+- RISC-V为三个特权级 (U-mode, S-mode, M-mode) 分别定义了三种中断 (时钟中断, 软件中断, 外设中断)
+
+- RISC-V定义了十几种异常类型 (包括内存读取带来的越界, 内存写入带来的越界, 非法指令, ecall等)
 
 ![pic](./pictures/01.png)
 
-接下来讨论物理内存管理的函数实现:
+**关于CLINT和PLIC:**
 
-```
-void pmem_init();    // 初始化系统, 只调用一次
-void* pmem_alloc();  // 申请一个空闲的物理页
-void pmem_free();    // 释放一个之前申请的物理页
-```
+- CLINT (core-local interruptor) 是每个CPU都有的机制, 负责接收**时钟中断和软件中断**
 
-这三个函数体现了经典的共享资源管理方法：初始化共享资源, 占有共享资源, 释放共享资源
+- PLIC (platform-level interrupt controller) 是所有CPU共享的机制, 负责接收**外设中断**
 
-在**kernel/lib/utils.c**里我们新增了三个辅助函数, 能简化一些操作
+本次实验我们主要实现串口中断(一种外设中断)和时钟中断
 
-为了保证资源共享的可靠性, 当尝试访问`alloc_region`时需要获取和释放自旋锁
+## 串口中断
 
-## 第一阶段: 测试用例
+**任务清单:**
 
-**test-1**
+1. 由于OS内核主要运行在S-mode, 需要在start函数进入main函数之前, 将trap响应的任务"委托"给S-mode (寄存器操作)
 
-```c
-volatile static int started = 0;
+2. lab-1给了一个UART输入函数的初步版本, 你需要让它支持换行和Backspace的能力, 思考一下怎么修改
 
-volatile static int over_1 = 0, over_2 = 0;
+3. 找到一种方法识别UART输入引发的中断信号
 
-static int* mem[1024];
+4. 在合适的地方调用完善后的`uart_intr`来处理UART中断 (只用回显字符)
 
-int main()
-{
-    int cpuid = r_tp();
+**1和2比较容易, 下面具体介绍3和4:**
 
-    if(cpuid == 0) {
+首先关注`trap_kernel_init`和`trap_kernel_inithart`, 你应该在`main`的合适位置调用它们, 完成中断相关初始化
 
-        print_init();
-        pmem_init();
+初始化过程包括: 设置各种中断的优先级、使能中断开关、设置响应阈值等, 主要在`plic_init`和`plic_inithart`中
 
-        printf("cpu %d is booting!\n", cpuid);
-        __sync_synchronize();
-        started = 1;
+`trap_kernel_inithart`还做了一个重要的工作, 将S-mode的中断入口地址设置为`kernel_vector`(in trap.S)
 
-        for(int i = 0; i < 512; i++) {
-            mem[i] = pmem_alloc(true);
-            memset(mem[i], 1, PGSIZE);
-            printf("mem = %p, data = %d\n", mem[i], mem[i][0]);
-        }
-        printf("cpu %d alloc over\n", cpuid);
-        over_1 = 1;
-        
-        while(over_1 == 0 || over_2 == 0);
-        
-        for(int i = 0; i < 512; i++)
-            pmem_free((uint64)mem[i], true);
-        printf("cpu %d free over\n", cpuid);
+意味着在S-mode发生中断后, PLIC会立刻让执行流跳转到`kernel_vector`的位置
 
-    } else {
+`kernel_vector`的逻辑分为四个部分 (前置知识:RISC-V规定函数栈在内存里从高地址向低地址生长):
 
-        while(started == 0);
-        __sync_synchronize();
-        printf("cpu %d is booting!\n", cpuid);
-        
-        for(int i = 512; i < 1024; i++) {
-            mem[i] = pmem_alloc(true);
-            memset(mem[i], 1, PGSIZE);
-            printf("mem = %p, data = %d\n", mem[i], mem[i][0]);
-        }
-        printf("cpu %d alloc over\n", cpuid);
-        over_2 = 1;
+- 上下文保存: 函数栈扩展以空出32*8个字节的空间, 将32个通用寄存器的状态保存到内存空间
 
-        while(over_1 == 0 || over_2 == 0);
+- 进入核心的陷阱处理逻辑: `call trap_kernel_handler`
 
-        for(int i = 512; i < 1024; i++)
-            pmem_free((uint64)mem[i], true);
-        printf("cpu %d free over\n", cpuid);        
- 
-    }
-    while (1);    
-}
-```
+- 上下文恢复: 从内存空间恢复32个通用寄存器的状态, 收缩函数栈以释放这部分内存空间
 
-这个测试用例的作用是：
+- 通过`sret`从陷阱处理执行流回到正常执行流
 
-1. cpu-0和cpu-1并行申请内核空间的全部物理内存, 赋值并输出信息
+可以看出, 其实`kernel_vector`核心就是为了保证`trap_kernel_handler`能不受干扰地执行
 
-2. 待申请全部结束, 并行释放所有申请的物理内存
+`trap_kernel_handler`的逻辑本质就是一个`switch-case`过程:
 
-理想的输出结果可能是这样的：
+- 通过状态寄存器保存的信息判断trap类型 (两个大类 + N个小类)
 
-![pic](./pictures/03.png)
+- 调用合适的处理函数来响应对应类型的trap (`external_interrupt_handler`)
 
-**test-2**
+- 如果遇到意料之外/无法处理的中断和异常, 输出报错信息并终止即可
 
-```c
-/*--------------------------------- 测试代码 ----------------------------------*/
+`external_interrupt_handler` 需要利用PLIC提供的能力来判断是哪一种外设中断
 
-// 测试目标：耗尽内核/用户区域内存 
-void test_case_1()
-{
-    void *page = NULL;
+如果发现是串口中断, 调用对应的`uart_intr`作处理
 
-    while (1)
-    {
-        page = pmem_alloc(true);
-        // page = pmem_alloc(false);
-    }
-}
+**逻辑流程梳理**: 串口中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->
 
-#define TEST_CNT 10
+`external_interrupt_handler`->`uart_intr`->`kernel_vector`后半部分
 
-// 测试目标: 常规申请和释放操作
-void test_case_2()
-{
-    alloc_region_t *user_ar = &user_region;
-    uint64 user_pages[TEST_CNT];
+## 时钟中断
 
-    for (int i = 0; i < TEST_CNT; i++)
-        user_pages[i] = 0;
+时钟是计算机的核心地层机制之一, 是机器指令有序执行的"心跳"或"节拍"
 
-    printf("=== test_case_2: Phase 1 - Allocate User Pages ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-    {
-        user_pages[i] = (uint64)pmem_alloc(false);
+**RISC-V提供的时钟模型是这样的:**
 
-        printf("Allocated user page[%d] @ %p\n", i, (void *)user_pages[i]);
+- **cycle**是最基本的时间单位, 不可拆分
 
-        if (!(user_pages[i] >= user_ar->begin && user_pages[i] < user_ar->end))
-        {
-            printf("Assertion failed: Page address out of bounds! Page: %p, Region: [%p, %p)\n",
-                   (void *)user_pages[i], (void *)user_ar->begin, (void *)user_ar->end);
-            panic("Page address out of user region bounds");
-        }
+- **MTIME**寄存器存储了从内核启动到此刻的cycle数量--`C1`
 
-        memset((void *)user_pages[i], 0xAA, PGSIZE);
-    }
+- **MTIMECMP**寄存器存储了一个目标的cycle数量--`C2`
 
-    printf("=== test_case_2: Phase 2 - Pre-free Check ===\n");
-    spinlock_acquire(&user_ar->lk);
-    int expected_before = (user_ar->end - user_ar->begin) / PGSIZE - TEST_CNT;
-    int actual = user_ar->allocable;
-    printf("Expected allocable: %d, Actual: %d\n", expected_before, actual);
-    assert(user_ar->allocable == expected_before, "Allocable count incorrect before free");
-    spinlock_release(&user_ar->lk);
+- 如果某个时刻`C1`和`C2`相等, 则产生一个**时钟中断信号**
 
-    printf("=== test_case_2: Phase 3 - Free Pages ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-    {
-        pmem_free(user_pages[i], false);
-        printf("Free user page[%d] @ %p\n", i, (void *)user_pages[i]);
-    }
+- 时钟中断处理过程中, **MTIMECMP**寄存器会被更新成一个更大的值, 以确保一段时间后能再次触发时钟中断
 
-    printf("=== test_case_2: Phase 4 - Post-free Check ===\n");
-    spinlock_acquire(&user_ar->lk);
-    int expected_after = (user_ar->end - user_ar->begin) / PGSIZE;
-    actual = user_ar->allocable;
-    printf("Expected allocable: %d, Actual: %d\n", expected_after, actual);
-    assert(user_ar->allocable == expected_after, "Allocable count not restored after free");
-    if (user_ar->list_head.next != NULL)
-        printf("Free list head @ %p\n", user_ar->list_head.next);
-    else
-        panic("Free list is empty after freeing pages");
-    spinlock_release(&user_ar->lk);
+- 通常来说, **MTIMECMP**寄存器的每次更新都是`C2 = C2 + INTERVAL`, 以保证规律性
 
-    printf("=== test_case_2: Phase 5 - Reallocate & Verify Zero ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-    {
-        void *page = pmem_alloc(false);
-        printf("Reallocated page[%d] @ %p\n", i, page);
+- 也就是说, 每隔**INTERVAL**个cycle, 产生一个时钟中断, 这个间隔被称为**tick**
 
-        bool non_zero = false;
-        for (int j = 0; j < PGSIZE / sizeof(int); j++)
-        {
-            if (((int *)page)[j] != 0)
-            {
-                non_zero = true;
-                printf("Non-zero value detected at offset %d: 0x%x\n", j, ((int *)page)[j]);
-                break;
-            }
-        }
-        assert(!non_zero, "Memory not zeroed after free");
-        printf("Zero verification passed\n");
-    }
+- 在我们的环境下, **INTERVAL**默认设置为1000000, 对应真实世界的大约0.1秒
 
-    printf("test_case_2 passed!\n");
-}
-```
+OS内核维护了一个全局的系统时钟, 它由一个ticks和自选锁组成
 
-这个测试用例的作用是：
+你需要完成三个简单的操作函数: 时钟初始化, 时钟写入(ticks++), 时钟读取(返回ticks)
 
-1. 测试内存耗尽的`panic`是否正常触发
+**完成前置步骤后, 我们正式讨论时钟中断的实现:**
 
-2. 测试用户空间物理页申请和释放的正确性
+相比串口中断, 时钟中断的一个重要区别是: 相关寄存器(**MTIME**、**MTIMECMP**等)只能在M-mode访问
 
-## 第二阶段: 内核态虚拟内存
+因此, 时钟中断处理分为M-mode部分逻辑和S-mode部分逻辑
 
-完成物理内存管理的部分后, 你应该注意到“内存”和“串口”这两种共享资源的区别:
+**M-mode部分:**
 
-**串口资源是没有区别的, 而内存资源被细分为很多个通过"地址"来区分的4KB物理页**
+- 在`start`进入`main`之前, 需要完成时钟初始化
 
-- 因此, 我们需要一种机制来记录每个程序获得了哪些4KB物理页面
+- 时钟初始化函数`timer_init`负责设置**MTIMECMP**寄存器的初始值、设置M-mode的trap处理入口、使能时钟中断等
 
-- 此外, 考虑到内存编程模型的灵活性和通用性, 我们需要给各个应用程序提供“独占内存资源”的幻觉
+- 时钟中断发生后, 执行流自动跳转到**mtvec**寄存器中存放的`timer_vector`(in trap.S)
 
-为了实现这两个目的, 我们引入**虚拟内存**这一重要概念
+- `timer_vector`与`timer_init`通过**cur_mscratch**变量完成精妙配合, 实现**MTIMECMP**寄存器的更新
 
-简单来说, 我们要建立一个表格, 用于记录虚拟地址空间到物理地址空间的对应关系, 并通过MMU自动完成翻译
+- 手动制造一个S-mode的软件中断, 将控制流转移到S-mode的trap处理入口`kernel_vector`
 
-**kernel/mem/type.h** 中的注释介绍了虚拟内存的一种规范**SV39**, 即39 bit虚拟地址的虚拟内存
+- 通过`mret`从陷阱处理执行流回到正常执行流
 
-之所以要遵守这个规范, 是为了能在RISC-V体系结构的机器上正常使用MMU,  你可以查看手册获得更多信息
+**S-mode部分:**
 
-虚拟内存的构建围绕两个核心概念：**页表项(PTE)** 和 **页表(pgtbl)**
+软件中断发生->`kernel_vector`前半部分->`trap_kernel_handler`->`timer_interrupt_handler`
 
-页表是由页表项构成的, 你可以理解成数组和数组里元素的关系
+->`timer_update` + 宣布S-mode软件中断处理完成->`kernel_vector`后半部分
 
-一个页表项对应一个物理页, 页表项主要由两部分组成：
-
-- 它所管理的物理页的**页号** (PPN字段)
-
-- 它所管理的物理页的**标志位** (低10bit)
-
-**提示:** 页表本身也是存放在物理页中, 这种物理页的特点是PTE的标志位中`PTE_R PTE_W PTE_X`都是0
-
-听起来很不可思议, 这个物理页不能读不能写不能执行? 其实这只是RISC-V的规定, 不必深究
-
-下面的图片显示了页表的示意图和实际状态:
+**时钟中断的流程图如下所示:**
 
 ![pic](./pictures/02.png)
 
-页表(比如`kernel_pgtbl`)刚刚初始化是只是一个被清空的4KB物理页
+## 测试用例
 
-随着`mmap`操作的增加, 页表开始伸展出去, 直至完全长成一个能管理512GB内存空间的树
+**1. 时钟滴答测试, 在合适的地方加一行滴答输出**
 
-关于页表的三级组织结构:
+![pic](./pictures/03.png)
 
-- 能从**顶级页表**的PTE里获得**次级页表**所在的物理页的物理页号和标志位
+**2. 时钟快慢测试, 在合适的地方加一行ticks输出**
 
-- 能从**次级页表**的PTE里获得**低级页表**所在的物理页的物理页号和标志位
+![pic](./pictures/04.png)
 
-- 能从**低级页表**的PTE里获得**一般物理页**(真正存储数据和代码)的物理页号和标志位
+tips: 修改**INTERVAL**, 观察ticks输出速度, 体会时钟滴答的快慢变化
 
-到此为止, 你应该对页表和页表项建立起基本的认识了: 页表是存储分级页表项的树形结构
-
-介绍完背景之后简单说明你需要做的事情, **kvm.c**中的函数推荐按照以下顺序去实现
-
-`vm_getpte -> vm_mappages -> vm_unmappages`
-
-**提示:** 实现过程中可以使用 **kernel/mem/type.h** 中的宏定义
-
-**核心:** 理解页表的构成(页表项与三级映射)和页表操作(映射与解映射)
-
-我们提供了一个`vm_print`函数, 它可以输出页表中所有有用信息, 可以用于Debug
-
-完成基本的页表操作函数后, 我们需要给内核页表 **kernel_pgtbl**设置映射关系并为每个CPU启用它
-
-`kvm_init -> kvm_inithart`
-
-**kernel_pgtbl** 的映射大致可以划分成两部分:
-
-- 硬件寄存器区域, 这部分地址空间不能分配回收只能读写, 可以理解为QEMU保留的"假地址"
-
-- 可用内存区域, 即0x80000000 到 0x80000000 + 128 MB
-
-内核页表对这两部分的映射都是**虚拟地址等于物理地址**的直接映射, 未来的用户页表则不同
-
-映射完毕后我们的**kernel_pgtbl**就可以上线工作了, 把它写入**satp**寄存器正式开启**MMU**翻译
-
-我们终于结束了直接访问物理地址(`w_satp(0)`)的时代 (虽然目前物理地址恰好等于虚拟地址)
-
-之后的内存访问本质都是访问虚拟地址, 虚拟地址经过页表和MMU的协作, 被自动翻译为物理地址
-
-## 第二阶段: 测试用例
-
-**test-1**
-
-```c
-int main()
-{
-    int cpuid = r_tp();
-
-    if(cpuid == 0) {
-
-        print_init();
-        pmem_init();
-        kvm_init();
-        kvm_inithart();
-
-        printf("cpu %d is booting!\n", cpuid);
-        __sync_synchronize();
-        // started = 1;
-
-        pgtbl_t test_pgtbl = pmem_alloc(true);
-        uint64 mem[5];
-        for(int i = 0; i < 5; i++)
-            mem[i] = (uint64)pmem_alloc(false);
-
-        printf("\ntest-1\n\n");    
-        vm_mappages(test_pgtbl, 0, mem[0], PGSIZE, PTE_R);
-        vm_mappages(test_pgtbl, PGSIZE * 10, mem[1], PGSIZE / 2, PTE_R | PTE_W);
-        vm_mappages(test_pgtbl, PGSIZE * 512, mem[2], PGSIZE - 1, PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, PGSIZE * 512 * 512, mem[2], PGSIZE, PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, VA_MAX - PGSIZE, mem[4], PGSIZE, PTE_W);
-        vm_print(test_pgtbl);
-
-        printf("\ntest-2\n\n");    
-        vm_mappages(test_pgtbl, 0, mem[0], PGSIZE, PTE_W);
-        vm_unmappages(test_pgtbl, PGSIZE * 10, PGSIZE, true);
-        vm_unmappages(test_pgtbl, PGSIZE * 512, PGSIZE, true);
-        vm_print(test_pgtbl);
-
-    } else {
-
-        while(started == 0);
-        __sync_synchronize();
-        printf("cpu %d is booting!\n", cpuid);
-         
-    }
-    while (1);    
-}
-```
-
-这个测试用例测试了两件事情:
-
-1. 使用内核页表后你的OS内核是否还能正常执行
-
-2. 使用映射和解映射操作修改你的页表, 使用vm_print输出它被修改前后的对比
-
-理想结果如下:
-
-![alt text](./pictures/04.png)
-
-**test-2**
-
-```c
-/*---------------------------------- 测试代码 --------------------------------*/
-
-void test_mapping_and_unmapping()
-{
-    // 1. 初始化测试页表
-    pte_t* pte;
-    pgtbl_t pgtbl = (pgtbl_t)pmem_alloc(true);
-    memset(pgtbl, 0, PGSIZE);
-
-    // 2. 准备测试条件
-    uint64 va_1 = 0x100000;
-    uint64 va_2 = 0x8000;
-    uint64 pa_1 = (uint64)pmem_alloc(false);
-    uint64 pa_2 = (uint64)pmem_alloc(false);
-
-    // 3. 建立映射
-    vm_mappages(pgtbl, va_1, pa_1, PGSIZE, PTE_R | PTE_W);
-    vm_mappages(pgtbl, va_2, pa_2, PGSIZE, PTE_R);
-
-    // 4. 验证映射结果
-    pte = vm_getpte(pgtbl, va_1, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_1 not found");
-    assert((*pte & PTE_V) != 0, "test_mapping_and_unmapping: pte_1 not valid");
-    assert(PTE_TO_PA(*pte) == pa_1, "test_mapping_and_unmapping: pa_1 mismatch");
-    assert((*pte & (PTE_R | PTE_W)) == (PTE_R | PTE_W), "test_mapping_and_unmapping: flag_1 mismatch");
-
-    pte = vm_getpte(pgtbl, va_2, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_2 not found");
-    assert((*pte & PTE_V) != 0, "test_mapping_and_unmapping: pte_2 not valid");
-    assert(PTE_TO_PA(*pte) == pa_2, "test_mapping_and_unmapping: pa_2 mismatch");
-    assert((*pte & (PTE_R | PTE_W)) == (PTE_R | PTE_W), "test_mapping_and_unmapping: flag_2 mismatch");
-
-    // 5. 解除映射
-    vm_unmappages(pgtbl, va_1, PGSIZE, true);
-    vm_unmappages(pgtbl, va_2, PGSIZE, true);
-
-    // 6. 验证解除映射结果
-    pte = vm_getpte(pgtbl, va_1, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_1 not found");
-    assert((*pte & PTE_V) == 0, "test_mapping_and_unmapping: pte_1 still valid");
-    pte = vm_getpte(pgtbl, va_2, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_2 not found");
-    assert((*pte & PTE_V) == 0, "test_mapping_and_unmapping: pte_2 still valid");
-
-    // 7. 由于页表的释放函数还没实现, 作为测试用例可以展示不释放页表空间
-
-    printf("test_mapping_and_unmapping passed!\n");
-}
-```
-
-这个测试用例主要关注映射和解映射是否正确执行
-
-理想输出如下图所示:
+**3. UART输入测试, 验证是否能输入字符并回显到屏幕上(包括Backspace和换行)**
 
 ![pic](./pictures/05.png)
 
 **补充更多测试用例**
 
-因为你未来会依赖现在写的这些函数, 如果现在没发现隐藏的错误, 未来的Debug会更困难
+助教给出的测试用例是远远不够的, 你需要补充更多测试用例以保证新增代码的正确性 
 
-所以每个模块写完后都要进行尽可能完善的测试, 助教提供的测试用例远远不够, 请对你的代码负责
+可以将你新增的测试用例和测试结果放在你的READM里面
 
 另外, 值得强调的一点是：学会使用`panic`和`assert`做必要的检查
 
 在出问题前输出有价值的错误信息, 比系统直接卡死或进入错误状态, 更容易Debug
 
-这种理论又叫**防御性编程**, 对输入参数保持警惕, 充分检查, 确保错误不会在函数间传递
-
 **尾声**
 
-这次实验在`kvm_init`里埋下了一些伏笔: CLINT、PLIC的寄存器映射还没用起来
+通过前三个实验, 我们搭建了OS内核的基础设施 (第一阶段)
 
-不要着急, 下一次实验的主题是——**中断和异常**, 那时会用到
+- lab-1: 机器启动、标准输出、自旋锁
 
-实验的基本原则之一: 绝大多数增添或修改只服务于本次的实验目标, 少量服务于下一次实验的实验目标
+- lab-2: 物理内存、内核态虚拟内存
 
+- lab-3: 中断和异常 (串口输入和时钟滴答)
+
+一切的准备都是为了引出OS内核世界中最重要的概念--进程 (第二阶段)
+
+- 进程需要基本的输入输出能力
+
+- 进程需要自己的内存资源和虚拟地址空间
+
+- 进程需要通过系统调用(一种异常)来获取OS内核服务
+
+**新手村任务结束了, 准备接受更大的挑战吧......**
