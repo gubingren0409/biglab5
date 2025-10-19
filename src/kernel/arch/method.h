@@ -1,5 +1,4 @@
 #pragma once
-#include "type.h"
 
 /* RISC-V相关的寄存器读写 */
 

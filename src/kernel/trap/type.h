@@ -1,5 +1,4 @@
 #pragma once
-#include "../lib/type.h"
 #include "../lock/type.h"
 
 // platform-level interrupt controller (PLIC)
