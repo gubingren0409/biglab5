@@ -60,7 +60,7 @@ ECNU-OSLAB-2025-TASK
     │   ├── trap   陷阱模块
     │   │   ├── plic.c
     │   │   ├── timer.c
-    │   │   ├── trap_kernel.c
+    │   │   ├── trap_kernel.c (CHANGE, 去掉了提示信息的static标记)
     │   │   ├── trap_user.c (TODO, 用户态陷阱处理)
     │   │   ├── trap.S
     │   │   ├── trampoline.S
@@ -210,10 +210,121 @@ Makefile中QEMU启动的部分, 我们传递给QEMU的参数是内核的可执�
 
 书接上文, `proc_make_first`在执行`swtch`之前会将`proczero.context.ra`设置为`trap_user_return`
 
-这提醒我们追随proczero的执行流, 将注意力从**proc.c**转移到**trap_user.c**和**trampoline.S**
+这意味着`swtch`之后, proczero的执行流启动, 起始位置是`trap_user_return`
 
-待续......
+让我们追随proczero的执行流, 将注意力从**proc.c**转移到**trap_user.c**和**trampoline.S**
+
+`trap_user_return`是进程从内核态进入用户态前的准备工作, 它负责:
+
+- 在`tf->user_to_kern_xxx`中保存一些内核态的运行信息
+
+- 将`user_vector`设为S-mode的trap处理入口 (控制流处于内核态则使用`kernel_vector`作为trap处理入口)
+
+- 将陷入内核时保存了`tf->sepc`写入sepc寄存器, 确保返回用户态后PC指针处于正确的未知
+
+- 将U-mode设为S-mode的上一个状态 (proczero第一次进入用户态时上一个状态不是U-mode, 手动设置一下)
+
+- 准备参数并调用**trampoline.S**中的`user_return`
+
+我们将**trampoline.S**中的`user_vector`和`user_return`作为一个整体来看待, 更好地理解这个过程
+
+- 在proczero第一次调用`user_return`时, 将`proczero->tf`保存到了`sscratch`寄存器
+
+- `user_vector`先将所有通用寄存器的值保存到`sscratch`寄存器指向的`trapframe`内存空间
+
+- `user_vector`随后恢复SP指针和hartid, 切换至内核页表, 调用`trap_user_handler`
+
+- `trap_user_handler`的工作在下一节做具体介绍, trap处理完成后进入返回阶段(`trap_user_return`)
+
+- `user_return`切换到用户页表, 恢复所有通用寄存器的值, 通过`sret`返回用户态
+
+相比`kernel_vector`和`trap_kernel_handler`组成的**A-B-A**结构
+
+`user_vector`、`trap_user_handler`、`trap_user_return`、`user_return`构成了更复杂的**A-B-C-D**结构
+
+值得注意的是: proczero 是直接从**C-D**开始的; 当用户态发生trap后, 才会走完**A-B-C-D**的完整过程
 
 ## 用户态陷阱处理
 
+让我们先总结一下目前提到的三类执行流:
+
+- S-mode内核程序: entry.S->start.c->main.c->proc_make_first->执行流停滞
+
+- S-mode用户程序: proczero刚诞生时处于S-mode, 遇到trap后也处于S-mode
+
+- U-mode用户程序: proczero中initcode的执行处于U-mode
+
+进一步理解context和trapframe的区别:
+
+- context是S-mode内核程序切换到S-mode用户程序需要用到的临时内存空间
+
+- trapframe是U-mode用户程序切换到S-mode用户程序需要用到的临时空间
+
+- context不涉及特权级切换, 需要保存的寄存器数量和其他信息更少
+
+接下来我们讨论最后一个部分: `trap_user_handler`
+
+由于`trap_user_handler`和`trap_kernel_handler`都是在S-mode处理trap, 所以整体逻辑基本一样
+
+主要区别在于:
+
+- 进入`trap_user_handler`后会重写trap入口, 将它设为`trap_kernel_handler`
+
+- `trap_user_handler`要记录一下发生trap的PC值放到trapframe中, 确保正确返回用户态
+
+- `trap_user_handler`需要多处理一种特殊的异常——**系统调用(syscall)**
+
+这是我们第一次正式介绍**系统调用**(最重要的异常), 它在RISC-V中对应U-mode发出的ecall (8号异常)
+
+注意: 系统调用虽然被划分为异常, 但是返回时应该设置 PC=PC+4 (通过修改epc来实现), 行为其实更接近中断
+
+系统调用是用户程序获得系统服务的唯一方法, 也是一切用户库的最底层依赖
+
+**系统调用的本质是一组约定:**
+
+- 用户程序传入系统调用号(sys_num)来指定系统调用类型
+
+- 内核程序根据系统调用号, 进入不同的响应分支: 读取其他参数, 提供系统服务, 返回处理结果
+
+- 用户程序和内核程序通过trap机制进行通信, 实现跨特权级的"函数调用"
+
 ## 测试
+
+**测试一: 系统调用**
+
+```c
+#include "sys.h"
+
+int main()
+{
+    syscall(SYS_helloworld);
+    syscall(SYS_helloworld);
+    while (1)
+        ;
+    return 0;
+}
+```
+
+**initcode.c**里, 用户程序发出了两次系统调用, `trap_user_handler`需要正确地响应它们
+
+方法很简单: 输出`proczero: hello world!\n`即可
+
+这个测试用于验证第一个用户进程是否能和内核交互并获得内核提供的服务
+
+**测试二: 用户态的时钟中断和串口中断**
+
+LAB-3中我们验证了内核态时钟中断和串口中断的响应
+
+现在请你测试一下, 在用户态, 中断响应是否能正常工作
+
+**尾声**
+
+相信你可以感觉到, 用户进程的引入明显提高了OS内核的复杂度
+
+进程模块和内存模块、陷阱模块有着密切的联系, 牵一发而动全身
+
+因此, 我们做了细致的拆分, 让用户进程能力逐步变强, 数量由一到多
+
+- 在LAB-5: 我们将赋予proczero更强大的内存管理能力, 并建立真正的系统调用体系
+
+- 在LAB-6：我们将引入proczero的子子孙孙, 实现完整的进程生命周期管理和多进程调度
