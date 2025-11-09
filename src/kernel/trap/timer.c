@@ -59,3 +59,9 @@ uint64 timer_get_ticks()
 {
 
 }
+
+// 让进程睡眠ntick个时钟周期
+void timer_wait(uint64 ntick)
+{
+
+}
