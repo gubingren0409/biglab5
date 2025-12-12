@@ -1,647 +1,145 @@
-# LAB-8: 文件系统 之 数据组织与层次结构
-
-**前言**
-
-在lab-7中我们实现了block-level的磁盘管理能力
-
-在此基础上, 本次实验将进一步考虑以下两个问题:
-
-1. 如果数据块的大小大于1个block, 如何组织和管理? (inode)
-
-2. 如何用人类更好理解的层次结构来组织和索引海量数据块? (dentry)
-
-## 代码组织结构
-
-```
-ECNU-OSLAB-2025-TASK
-├── LICENSE        开源协议
-├── .vscode        配置了可视化调试环境
-├── registers.xml  配置了可视化调试环境
-├── .gdbinit.tmp-riscv xv6自带的调试配置
-├── common.mk      Makefile中一些工具链的定义
-├── Makefile       编译运行整个项目
-├── kernel.ld      定义了内核程序在链接时的布局
-├── picture        README使用的图片目录 (CHANGE)
-├── README.md      实验指导书 (CHANGE)
-└── src            源码
-    ├── kernel     内核源码
-    │   ├── arch   RISC-V相关
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── boot   机器启动
-    │   │   ├── entry.S
-    │   │   └── start.c
-    │   ├── lock   锁机制
-    │   │   ├── spinlock.c
-    │   │   ├── sleeplock.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── lib    常用库
-    │   │   ├── cpu.c
-    │   │   ├── print.c
-    │   │   ├── uart.c
-    │   │   ├── utils.c (CHANGE, 新增strlen函数)
-    │   │   ├── method.h (CHANGE)
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── mem    内存模块
-    │   │   ├── pmem.c
-    │   │   ├── kvm.c
-    │   │   ├── uvm.c
-    │   │   ├── mmap.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── trap   陷阱模块
-    │   │   ├── plic.c
-    │   │   ├── timer.c
-    │   │   ├── trap_kernel.c
-    │   │   ├── trap_user.c
-    │   │   ├── trap.S
-    │   │   ├── trampoline.S
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── proc   进程模块
-    │   │   ├── proc.c
-    │   │   ├── swtch.S
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── syscall 系统调用模块
-    │   │   ├── syscall.c
-    │   │   ├── sysfunc.c
-    │   │   ├── method.h
-    │   │   ├── mod.h
-    │   │   └── type.h
-    │   ├── fs     文件系统模块
-    │   │   ├── bitmap.c
-    │   │   ├── buffer.c
-    │   │   ├── inode.c (TODO, 核心工作)
-    │   │   ├── dentry.c (TODO, 核心工作)
-    │   │   ├── fs.c (TODO, 增加inode初始化逻辑和测试用例)
-    │   │   ├── virtio.c
-    │   │   ├── method.h (CHANGE)
-    │   │   ├── mod.h
-    │   │   └── type.h (CHANGE)
-    │   └── main.c
-    ├── mkfs       磁盘映像初始化
-    │   ├── mkfs.c (CHANGE, 更复杂的文件系统初始化)
-    │   └── mkfs.h (CHANGE)
-    └── user       用户程序
-        ├── initcode.c
-        ├── sys.h
-        ├── syscall_arch.h
-        └── syscall_num.h
-```
+LAB-8 实验报告：文件系统实现
 
-**标记说明**
+1. 实验概述
 
-**NEW**: 新增源文件, 直接拷贝即可, 无需修改
+本实验旨在操作系统内核中构建一个完整的文件系统。在 Lab-7 实现的块设备驱动（Block Driver）和缓冲区高速缓存（Buffer Cache）的基础上，本次实验向上抽象出了 inode（索引节点） 和 dentry（目录项） 两个核心概念，实现了从底层无结构的磁盘块到上层层次化文件树的跨越。
 
-**CHANGE**: 旧的源文件发生了更新, 直接拷贝即可, 无需修改
+核心工作包括：
 
-**TODO**: 你需要实现新功能 / 你需要完善旧功能
 
-## mkfs: 带根目录的初始磁盘映像
 
-lab-7的初始磁盘映像虽然有inode_bitmap和inode_region, 但是并不存在真正的inode
+磁盘布局设计：通过 mkfs 工具初始化磁盘映像。
 
-在本次实验中, 我们首先添加了根目录 (root_inode)
+数据组织：实现 inode 的多级索引机制（直接/一级间接/二级间接），支持大文件存储。
 
-随后, 在根目录之下增加了四个目录项:
+生命周期管理：实现内存 inode 缓存池（Inode Cache），处理引用计数与并发锁。
 
-- "." 和 "..": 特殊目录项, 用于描述相对路径, 本次实验不展开描述
+目录管理：实现目录项（dentry）的增删查，构建文件名到 inode 号的映射。
 
-- "ABCD.txt" 和 "abcd.txt": 循环写入字母表(大写版本和小写版本)的普通文件
+路径解析：实现绝对路径解析逻辑，支持多级目录跳转。
 
-请你阅读`mkfs.h`和`mkfs.c`来理解初始化过程的具体行为, 这将帮助你理解**inode**和**dentry**的概念
+2. 核心模块实现详解
 
-## inode: 文件数据组织
+2.1 磁盘映像初始化 (mkfs)
 
-从磁盘角度来看, 文件就是由N个block构成的逻辑单元
+为了让内核启动时有一个可用的文件系统，我们编写了 mkfs 工具在用户态生成初始的磁盘映像 disk.img。
 
-inode负责记录这样的逻辑结构, 主要依靠**index**字段和**size**字段
 
-**index字段的设计分成三个部分:**
 
-- 0 ~ INODE_INDEX_1 - 1: 直接映射(index[i] = data_block), 控制前面40KB空间 (小型文件)
+磁盘布局：[ Super Block | Inode Bitmap | Inode Blocks | Data Bitmap | Data Blocks ]
 
-- INODE_INDEX_1 ~ INODE_INDEX_2 - 1: 一级间接映射(index[i] = index_block), 控制中间8MB空间 (中型文件)
+根目录构建：初始化了根目录（inode 0），并预置了 . 和 .. 目录项。
 
-- INODE_INDEX_2 ~ INODE_INDEX_3 - 1: 二级间接映射(index[i] = index_index_block), 控制后面4GB空间 (大型文件)
+测试文件：预置了 ABCD.txt 和 abcd.txt 用于后续的读写测试。
 
-**这样设计的好处是:**
+2.2 索引节点 (Inode) 与数据组织
 
-- 小型文件的访问非常迅速 (直接访问inode就能直接获得data_block序号)
+Inode 是文件系统的核心元数据结构。我们在 src/kernel/fs/inode.c 中实现了其管理逻辑。
 
-- 能支持很大的文件 (以1个index_index_block和1024个index_block的额外访问开销为代价)
 
-- 中型文件的访问代价可控 (以2个index_block的额外访问开销为代价)
 
-**和之前的内核页表设计进行对比:**
+2.2.1 多级索引机制
 
-- index是各个文件的私有映射逻辑, 内核页表是系统全局的映射逻辑, 因此内存页面不存在前面热后面冷的性质
+为了兼顾小文件的访问效率和大文件的存储能力，我们实现了混合索引机制：
 
-- 因此, 页表是确定的三级间接映射, 文件映射则是直接映射、一级间接映射、二级间接映射相结合(按需启用)
 
-**关于size字段(单位是字节)的说明:**
 
-- 对于**INODE_TYPE_DATA**类型的inode, size除了代表有效的数据量, 还代表[0, size)的逻辑空间已经使用 (没有空洞)
+直接映射 (index[0-9])：直接指向数据块，支持 40KB 以下的小文件快速访问。
 
-- 对于**INODE_TYPE_DIR**类型的inode, 我们假设它只使用1个block(index[0]记录), size只代表有效数据量 (接受空洞)
+一级间接映射 (index[10-11])：指向索引块，每个索引块存储 1024 个指针，支持 8MB 级文件。
 
-**当你完全理解上述逻辑后, 我们开始进入具体的函数 (in inode.c)**
+二级间接映射 (index[12])：指向“索引的索引”，支持 4GB 级的大文件。
 
-首先实现帮助函数`free_data_blocks`和`locate_or_add_block`
+实现函数：locate_or_add_block。该函数负责将逻辑块号（Logical Block Number）翻译为物理块号，并在写入时自动分配缺失的磁盘块（包括数据块和中间索引块）。
 
-`free_data_blocks`本质是通过`bitmap_free_data`释放inode管理的所有block资源
 
-考虑到树形组织结构, 我们使用递归方法来实现这一点 (调用`__free_data_blocks`)
 
-注意: 起到索引作用的index_block和index_index_block也要释放
+2.2.2 内存 Inode 缓存 (Inode Cache)
 
-`locate_or_add_block`负责将逻辑块号转译为物理块号 (例:inode的第一个逻辑块0对应物理块1120)
+为了减少磁盘 I/O，我们在内存中维护了一个 inode_cache 池。
 
-转译过程中可能遇到目标逻辑块号恰好超过边界 (例:分配了N个逻辑块, 目标逻辑块号为N)
 
-这种时候需要新分配一个物理块, 使得目标逻辑块号合法
 
-比较复杂的情况: 新增data_block可能带来连锁反应 (新增index_index_block和新增index_block)
+结构设计：区分 inode_disk_t（磁盘持久化数据）和 inode_t（内存运行时数据）。
 
-这一点和页表的生长过程是类似的, 需要你细心和谨慎地处理
+同步机制：
 
-之后实现数据流读写逻辑`inode_read_data`和`inode_write_data`
+自旋锁 (lk_inode_cache)：保护缓存池的分配和引用计数 (ref)。
 
-它们的共同点在于: 以1个buffer为中间载体, 实现数据在磁盘块和通用内存空间之间的流转
+睡眠锁 (slk)：保护 inode 的具体内容（如 size, index）读写，允许进程在等待磁盘 I/O 时睡眠。
 
-需要注意的一点: 写入逻辑可能涉及inode的修改 (包括index和size), 文件大小不能超过上限
+生命周期：
 
-## inode: 生命周期管理
+inode_get：查找缓存或分配空闲槽位，增加引用计数。
 
-我们使用**inode_cache**来管理内存中的inode资源, 通过**lk_inode_cache**来保护它
+inode_put：减少引用计数。当 ref=0 且 nlink=0（硬链接数为0）时，触发 inode_delete 彻底回收磁盘资源。
 
-这种组织结构在`mmap`、`proc`、`buffer`等地方多次遇到, 这里也是类似的 (只是没有选择使用双向循环链表做加速)
+2.3 目录项 (Dentry)
 
-请你完成`inode_init`来初始化资源, 并放入`fs_init`的合适位置
+Dentry 负责实现“文件名字符串”到“inode 编号”的映射，从而构建出人类可读的目录树。我们在 src/kernel/fs/dentry.c 中实现了相关逻辑。
 
-下一个需要思考的问题是: **inode in disk** 与 **inode in memory**的区别与互相更新
 
-```c
-/* 磁盘上的索引节点(64 Byte) */
-typedef struct inode_disk {
-	short type;                          // 文件类型
-	short major;                         // 主设备号
-	short minor;                         // 次设备号
-	short nlink;                         // 链接数
-	unsigned int size;                   // 文件数据长度(字节)
-	unsigned int index[INODE_INDEX_3];   // 数据存储位置(10+2+1)
-} inode_disk_t;
 
-/* 内存里的索引节点 */
-typedef struct inode {
-	inode_disk_t disk_info;           // 持久化信息 (slk保护)
-	bool valid_info;                  // disk_info的有效性 (slk保护)
-	uint32 inode_num;                 // inode序号 (slk保护)
-	uint32 ref;                       // 引用数 (lk_inode_cache保护)
-	sleeplock_t slk;                  // 睡眠锁
-} inode_t;
-```
+存储格式：目录被视为一种特殊的文件，其数据块中存储的是 dentry_t 结构体数组。
 
-相比**inode_disk_t**, **inode_t** 增加了四个字段:
+核心操作：
 
-- valid_info: inode_cache miss后返回的空闲inode, 它的disk_info是无效的, 需要特殊标记
+dentry_search：线性扫描目录的数据块，查找匹配文件名的 inode 号。
 
-- ref: inode_cache中的inode可以被多个使用者关注, 需要记录一下引用数
+dentry_create：在目录中寻找空闲槽位（或追加新块）写入新的目录项。
 
-- inode_num: 进行**inode_disk_t**和**inode_t**的互相更新时, 需要知道磁盘中的inode位置
+dentry_delete：将指定文件名的目录项清零，标记为未使用。
 
-- slk: 保证资源的按需共享, 由于磁盘读写非常耗时, 所以采用睡眠锁而非自旋锁
+2.4 路径解析 (Path Resolution)
 
-之后请你实现`inode_rw`完成此磁盘inode_region中的inode和内存inode_cache中的inode的互相更新
+基于 Dentry，我们实现了从绝对路径（如 /home/user/file.txt）找到目标 Inode 的逻辑。
 
-- 初始化时: 通常是 磁盘->内存 的更新流 (读入一个新的inode)
 
-- 修改时: 通常时 内存->磁盘 的更新流 (inode中的字段做了修改, 需要写回)
 
-下面实现典型的inode生命周期控制函数 (按照从生到死的过程)：
+解析流程：从根目录 (ROOT_INODE) 开始，利用 get_element 提取各级文件名，循环调用 dentry_search 逐级向下查找。
 
-- `inode_create`: 认为某个inode原本不存在, 先在内存里创建副本, 之后写入inode_region
+父目录解析：实现了 path_to_parent_inode，用于在创建新文件时获取目标路径父目录的 inode。
 
-- `inode_get`: 认为某个inode存在于内存inode_cache或者磁盘inode_region, 获取使用权
+2.4.1 关键 Bug 修复：路径解析死锁
 
-- `inode_dup`: 复制inode使用权 (例如执行fork操作时)
+在开发 path_to_parent_inode 时，我们遇到了严重的死锁问题（Test 4 卡死）。
 
-- `inode_lock`: 获取睡眠锁以保证独占inode
 
-- `inode_unlock`: 释放睡眠锁以支持共享inode
 
-- `indoe_put`: 释放inode的使用权(ref--), 可能触发inode的磁盘删除操作
+问题现象：在解析如 .../dir/file 时，函数错误地将 file 当作目录继续进入，导致返回了 file 的 inode 而非 dir 的 inode。后续代码试图对同一个 inode 加锁两次（先锁子节点，后锁父节点，但二者变成了同一个），触发死锁。
 
-- `inode_delete`: 删除磁盘里的某个node, 并释放它管理的data_block资源
+解决方案：修正了循环终止条件。通过检查 get_element 的返回值（剩余路径指针）是否为 NULL 来准确判断路径是否结束，确保正确返回父目录的 inode。
 
-最后, 我们提供了`inode_print`函数来输出某个inode的具体信息
+3. 测试验证
 
-## dentry: 从数字索引到字符串索引
+我们通过内核启动时的自检程序 (fs_init) 完成了四个阶段的测试，所有测试均通过。
 
-**有了inode的文件系统世界是什么样的呢?**
 
-- 我们可以先用**inode_num**搜索**inode_region**, 找到某个inode (定位元数据)
 
-- 再通过inode里的索引信息, 按照逻辑顺序找到它管理的若干**block** (定位数据)
+Test 1: Inode 基础操作
 
-对于计算机来说, 这套逻辑已经足够高效了, 它建立了从数字到离散数据流的映射关系
+验证了 inode_create、inode_dup 和 inode_put。
 
-对人来说, 还存在一个致命的问题:**inode_num**太抽象了, 人类很难记住它的含义, 人更好理解的是**name**
+确认了引用计数归零后，位图（Bitmap）能正确回收 Inode 资源。
 
-我们可以把 **name=hello.c** 理解为一个"hello world"程序, 但是不能把 **inode_num=15** 理解成任何东西
+Test 2: 数据读写
 
-**因此, 我们决定增加一层映射逻辑: name -> inode_num**
+小文件：验证了直接索引的读写正确性。
 
-```c
-/* 目录项(64 Byte) */
-typedef struct dentry {
-    char name[MAXLEN_FILENAME];       // 文件名
-    unsigned int inode_num;           // 索引节点序号
-} dentry_t;
-```
+大文件：写入了跨越直接映射和间接映射的大型数据（约 170MB 虚拟大小），验证了 locate_or_add_block 中多级索引分配逻辑的正确性。
 
-更具体的设计方案:
+Test 3: 目录操作
 
-- 我们将第一个inode设为**根节点**, 记住它的inode_num为**ROOT_INODE(0)**
+验证了 dentry_search 能正确找到预置文件。
 
-- 根节点包括 `BLOCKSIZE/sizeof(dentry_t)` 个**dentry槽位**
+验证了 dentry_create 和 dentry_delete 能正确管理目录槽位。
 
-- 其他inode都通过注册1个dentry链接到根节点上, 形成**1-N**的二层树形结构
+Test 4: 路径解析
 
-- 查找逻辑从: inode_num->数据 变成了 ROOT_INODE->name->inode_num->数据
+验证了 path_to_inode 和 path_to_parent_inode 能正确解析多级路径 ///AABBC///aaabb/file.txt。
 
-用户只需要记住根节点的inode序号和目标inode的名称即可, 不需要知道目标inode的序号
+成功读取了通过路径写入的文件内容，证明文件系统层次结构功能完备。
 
-请你实现dentry的槽位管理逻辑:
+4. 总结
 
-- `dentry_search`: 在目录中查找某个dentry
-
-- `dentry_create`: 创建1个新的dentry
-
-- `dentry_delete`: 删除1个旧的dentry
-
-我们还提供了一个`dentry_print`用于打印某个目录下的所有有效dentry (dentry->name[0]!='\0'说明有效)
-
-## path: 从扁平化到层次化
-
-**1-N**的扁平化树形结构在inode数量较小时是好用的
-
-随着inode数量的增长: 一方面, 根节点的槽位不够用; 另一方面, 不方便人做分类查找和管理
-
-因此, 我们要将扁平化的数拓展为层次化的树, 支持`1-N-M-K...`的多层结构
-
-管理这样的结构需要多个目录类型的inode (仅靠根节点是不够的)
-
-描述树上的一个节点需要使用"文件路径(path)", 本次实验我们只考虑绝对路径
-
-例如: /AAA/BBB/CCC/file.txt、/AABB/CC、////AAA///CC//BB/file.txt等
-
-以/AAA/BBB/CCC.txt为例, 解释**路径解析**过程:
-
-- step-0: 通过ROOT_INODE(0)获得root_inode
-
-- step-1: 查询root_inode的dentry槽位, 发现"AAA"对应的inode_num为A1
-
-- step-2: 通过A1获得AAA_inode
-
-- step-3: 查询AAA_inode的dentry槽位, 发现"BBB"对应的inode_num为B1
-
-- step-4: 通过B1获得BBB_inode
-
-- step-5: 查询BBB_inode的dentry槽位, 发现"CCC.txt"对应的inode_num为C1
-
-- step-6: 通过C1获得CCC_inode, 进行后续的读写行为
-
-我们提供了`get_element`来逐步处理**path**和提取**name**, 请你先理解它的工作逻辑
-
-你需要利用`get_element`、`inode_get`、`dentry_search`等函数来实现`__path_to_inode`
-
-这个函数完成了从**path**到**目标inode**的翻译过程, 是`path_to_inode`和`path_to_parent_inode`的底层
-
-## 测试用例
-
-考虑到测试的便捷性, 请直接在`fs_init`的最后位置添加测试逻辑
-
-**测试1: inode的访问 + 创建 + 删除**
-
-预期结果见 `./picture/test-1.png`
-
-```c
-    /* fs_init in fs.c */
-
-	printf("============= test begin =============\n\n");
-
-	inode_t *rooti, *ip_1, *ip_2;
-	
-	rooti = inode_get(ROOT_INODE);
-	inode_lock(rooti);
-	inode_print(rooti, "root");
-	inode_unlock(rooti);
-
-	/* 第一次查看bitmap */
-	bitmap_print(false);
-
-	ip_1 = inode_create(INODE_TYPE_DIR, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	ip_2 = inode_create(INODE_TYPE_DATA, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	inode_lock(ip_1);
-	inode_lock(ip_2);
-	inode_dup(ip_2);
-
-	inode_print(ip_1, "dir");
-	inode_print(ip_2, "data");
-	
-	/* 第二次查看bitmap */
-	bitmap_print(false);
-
-	ip_1->disk_info.nlink = 0;
-	ip_2->disk_info.nlink = 0;
-	inode_unlock(ip_1);
-	inode_unlock(ip_2);
-	inode_put(ip_1);
-	inode_put(ip_2);
-
-	/* 第三次查看bitmap */
-	bitmap_print(false);
-
-	inode_put(ip_2);
-	
-	/* 第四次查看bitmap */
-	bitmap_print(false);
-
-	printf("============= test end =============\n\n");
-
-	while(1);
-```
-
-**测试2: 写入和读取inode管理的数据**
-
-注意: 大文件的写入过程较慢, 在助教的虚拟机中需要2分钟
-
-预期结果见 `./picture/test-2.png`
-
-```c
-    /* fs_init in fs.c */
-
-	printf("============= test begin =============\n\n");
-
-	inode_t *ip_1, *ip_2;
-	uint32 len, cut_len;
-
-	/* 小批量读写测试 */
-
-	int small_src[10], small_dst[10];
-	for (int i = 0; i < 10; i++)
-		small_src[i] = i;
-	
-	ip_1 = inode_create(INODE_TYPE_DATA, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	inode_lock(ip_1);
-	inode_print(ip_1, "small_data");
-
-	printf("writing data...\n\n");
-	cut_len = 10 * sizeof(int);
-	for (uint32 offset = 0; offset < 400 * cut_len; offset += cut_len) {
-		len = inode_write_data(ip_1, offset, cut_len, small_src, false);
-		assert(len == cut_len, "write fail 1!");
-	}
-	inode_print(ip_1, "small_data");
-
-	len = inode_read_data(ip_1, 120 * cut_len + 4, cut_len, small_dst, false);
-	assert(len == cut_len, "read fail 1!");
-	printf("read data:");
-	for (int i = 0; i < 10; i++)
-		printf(" %d", small_dst[i]);
-	printf("\n\n");
-
-	ip_1->disk_info.nlink = 0;
-	inode_unlock(ip_1);
-	inode_put(ip_1);
-
-	/* 大批量读写测试 */
-
-	char *big_src, big_dst[9];
-	big_dst[8] = 0;
-
-	/* 申请五个连续物理页面 (初始化阶段, 通常来说能拿到连续的) */
-	big_src = pmem_alloc(true);
-	assert(pmem_alloc(true) == big_src + PGSIZE, "contiguous fail!");
-	assert(pmem_alloc(true) == big_src + PGSIZE * 2, "contiguous fail!");
-	assert(pmem_alloc(true) == big_src + PGSIZE * 3, "contiguous fail!");
-	assert(pmem_alloc(true) == big_src + PGSIZE * 4, "contiguous fail!");
-
-	for (uint32 i = 0; i < 5 * (PGSIZE / 8); i++)
-		for (uint32 j = 0; j < 8; j++)
-			big_src[i * 8 + j] = 'A' + j;
-
-	ip_2 = inode_create(INODE_TYPE_DATA, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	inode_lock(ip_2);
-	inode_print(ip_2, "big_data");
-
-	printf("writing data...\n\n");
-	cut_len = PGSIZE * 4 + 1110;
-	for (uint32 offset = 0; offset < cut_len * 10000; offset += cut_len)
-	{
-		len = inode_write_data(ip_2, offset, cut_len, big_src, false);
-		assert(len == cut_len, "write fail 2!");
-	}
-	inode_print(ip_2, "big_data");
-
-	len = inode_read_data(ip_1, cut_len * 10000 - 8, 8, big_dst, false);
-	assert(len == 8, "read fail 2");
-	printf("read data: %s\n", big_dst);
-
-
-	ip_2->disk_info.nlink = 0;
-	inode_unlock(ip_2);
-	inode_put(ip_2);
-
-	pmem_free((uint64)big_src, true);
-	pmem_free((uint64)big_src + PGSIZE, true);
-	pmem_free((uint64)big_src + PGSIZE * 2, true);
-	pmem_free((uint64)big_src + PGSIZE * 3, true);
-	pmem_free((uint64)big_src + PGSIZE * 4, true);
-
-
-	printf("============= test end =============\n");
-
-	while(1);
-```
-
-**测试3: 目录项的增加、删除、查找操作**
-
-预期结果见 `./picture/test-3.png`
-
-```c
-    /* fs_init in fs.c */
-	printf("============= test begin =============\n\n");
-
-	inode_t *rooti, *ip_1, *ip_2, *ip_3;
-	uint32 inode_num_1, inode_num_2, inode_num_3;
-	uint32 len, cutlen, offset;
-	char tmp[10];
-
-	tmp[9] = 0;
-	cutlen = 9;
-	rooti = inode_get(ROOT_INODE);
-
-	/* 搜索预置的dentry */
-
-	inode_lock(rooti);
-	inode_num_1 = dentry_search(rooti, "ABCD.txt");
-	inode_num_2 = dentry_search(rooti, "abcd.txt");
-	inode_num_3 = dentry_search(rooti, ".");
-	if (inode_num_1 == INVALID_INODE_NUM || 
-		inode_num_2 == INVALID_INODE_NUM || 
-		inode_num_3 == INVALID_INODE_NUM) {
-		panic("invalid inode num!");
-	}
-	dentry_print(rooti);
-	inode_unlock(rooti);
-
-	ip_1 = inode_get(inode_num_1);
-	inode_lock(ip_1);
-	ip_2 = inode_get(inode_num_2);
-	inode_lock(ip_2);
-	ip_3 = inode_get(inode_num_3);
-	inode_lock(ip_3);
-
-	inode_print(ip_1, "ABCD.txt");
-	inode_print(ip_2, "abcd.txt");
-	inode_print(ip_3, "root");
-
-	len = inode_read_data(ip_1, 0, cutlen, tmp, false);
-	assert(len == cutlen, "read fail 1!");
-	printf("\nread data: %s\n", tmp);
-
-	len = inode_read_data(ip_2, 0, cutlen, tmp, false);
-	assert(len == cutlen, "read fail 2!");
-	printf("read data: %s\n\n", tmp);
-
-	inode_unlock(ip_1);
-	inode_unlock(ip_2);
-	inode_unlock(ip_3);
-	inode_put(ip_1);
-	inode_put(ip_2);
-	inode_put(ip_3);
-
-	/* 创建和删除dentry */
-	inode_lock(rooti);
-
-	ip_1 = inode_create(INODE_TYPE_DIR, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);	
-	offset = dentry_create(rooti, ip_1->inode_num, "new_dir");
-	inode_num_1 = dentry_search(rooti, "new_dir");
-	printf("new dentry offset = %d\n", offset);
-	printf("new dentry inode_num = %d\n\n", inode_num_1);
-	
-	dentry_print(rooti);
-
-	inode_num_2 = dentry_delete(rooti, "new_dir");
-	assert(inode_num_1 == inode_num_2, "inode num is not equal!");
-
-	dentry_print(rooti);
-
-	inode_unlock(rooti);
-	inode_put(rooti);
-
-	printf("============= test end =============\n");
-
-	while(1);
-```
-
-**测试4: 文件路径的解析**
-
-预期结果见 `./picture/test-4.png`
-
-```c
-    /* fs_init in fs.c */
-
-    printf("============= test begin =============\n\n");
-
-	inode_t *rooti, *ip_1, *ip_2, *ip_3, *ip_4, *ip_5;
-	
-	/* 准备测试环境 */
-
-	rooti = inode_get(ROOT_INODE);
-	ip_1 = inode_create(INODE_TYPE_DIR, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	ip_2 = inode_create(INODE_TYPE_DIR, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	ip_3 = inode_create(INODE_TYPE_DATA, INODE_MAJOR_DEFAULT, INODE_MINOR_DEFAULT);
-	
-	inode_lock(rooti);
-	inode_lock(ip_1);
-	inode_lock(ip_2);
-	inode_lock(ip_3);
-
-	if (dentry_create(rooti, ip_1->inode_num, "AABBC") == -1)
-		panic("dentry_create fail 1!");
-	if (dentry_create(ip_1, ip_2->inode_num, "aaabb") == -1)
-		panic("dentry_create fail 2!");
-	if (dentry_create(ip_2, ip_3->inode_num, "file.txt") == -1)
-		panic("dentry_create fail 3!");
-
-	char tmp1[] = "This is file context!";
-	char tmp2[32];
-	inode_write_data(ip_3, 0, sizeof(tmp1), tmp1, false);
-
-	inode_rw(rooti, true);
-	inode_rw(ip_1, true);
-	inode_rw(ip_2, true);
-
-	inode_unlock(rooti);
-	inode_unlock(ip_1);
-	inode_unlock(ip_2);
-	inode_unlock(ip_3);
-	inode_put(rooti);
-	inode_put(ip_1);
-	inode_put(ip_2);
-	inode_put(ip_3);
-
-	char *path = "///AABBC///aaabb/file.txt";
-	char name[MAXLEN_FILENAME];
-
-	ip_4 = path_to_inode(path);
-	if (ip_4 == NULL)
-		panic("invalid ip_4");
-
-	ip_5 = path_to_parent_inode(path, name);
-	if (ip_5 == NULL)
-		panic("invalid ip_5");
-	
-	printf("get a name = %s\n\n", name);
-
-	inode_lock(ip_4);
-	inode_lock(ip_5);
-
-	inode_print(ip_4, "file.txt");
-	inode_print(ip_5, "aaabb");
-
-	inode_read_data(ip_4, 0, 32, tmp2, false);
-	printf("read data: %s\n\n", tmp2);
-
-	inode_unlock(ip_4);
-	inode_unlock(ip_5);
-	inode_put(ip_4);
-	inode_put(ip_5);
-
-	printf("============= test end =============\n");
-```
-
-**尾声**
-
-本次实验我们实现了两个文件系统的基石: inode 和 dentry
-
-它们分别定义了文件系统的数据组织逻辑和层次化逻辑, 希望能帮助你理解文件系统的构建逻辑
-
-在lab-9中, 我们将先基于这两块基石构建**普通文件和目录文件**的管理逻辑
-
-之后, 秉持**一切皆文件**的Linux设计哲学, 我们还将介绍一类特殊的文件——**设备文件**
-
-最后, 我们还将讨论进程模块与文件系统的关系, 并补全进程模块的最后一块拼图——**proc_exec**
-
-**lab-9 既是文件系统的最终章、也是内核全系统的粘合剂、还是迄今为止最困难的终极考核!**
+Lab 8 成功实现了一个类 Unix 的简单文件系统。它不仅支持基础的数据持久化，还通过完善的 inode 缓存和锁机制保证了内核态的并发安全，通过多级索引支持了较大规模的文件存储，为后续 Lab 9（文件描述符与设备文件）和进程 exec 的实现奠定了坚实基础。
