@@ -197,6 +197,8 @@ inode_t* path_to_inode(char *path)
     解析路径，返回父目录inode，并将最后一个元素名填入name
     例如: path="/a/b/c" -> 返回 b_inode, name="c"
 */
+/* src/kernel/fs/dentry.c */
+
 inode_t* path_to_parent_inode(char *path, char *name)
 {
     inode_t *ip, *next_ip;
@@ -213,7 +215,9 @@ inode_t* path_to_parent_inode(char *path, char *name)
         char temp_name[MAXLEN_FILENAME];
         char *rest = get_element(path, temp_name);
         
-        if (temp_name[0] == 0) {
+        // [修改点]：检查 rest 是否为 0，而不是检查 temp_name
+        // 如果 rest 为 0，说明 get_element 没有找到下一个元素，路径已结束
+        if (rest == 0) {
             // 如果下一个元素为空，说明当前 name 已经是最后一个了
             // 此时 ip 正是 name 的父目录
             return ip;
