@@ -41,3 +41,50 @@ int strlen(const char *str)
     ;
   return i;
 }
+
+/* --- append to src/kernel/lib/utils.c --- */
+
+int strcmp(const char *p, const char *q)
+{
+    while (*p && *p == *q)
+        p++, q++;
+    return (unsigned char)*p - (unsigned char)*q;
+}
+
+char* strcpy(char *s, const char *t)
+{
+    char *os;
+
+    os = s;
+    while ((*s++ = *t++) != 0)
+        ;
+    return os;
+}
+
+char* strncpy(char *s, const char *t, int n)
+{
+    char *os;
+
+    os = s;
+    while (n-- > 0 && (*s++ = *t++) != 0)
+        ;
+    while (n-- > 0)
+        *s++ = 0;
+    return os;
+}
+
+/* --- append to src/kernel/lib/utils.c --- */
+
+void* memcpy(void *dst, const void *src, uint32 n)
+{
+    // memcpy 通常不处理重叠，但为了安全和简单，我们这里可以直接复用 memmove 逻辑
+    // 或者直接写一个简单的前向拷贝
+    char *s = (char *)src;
+    char *d = (char *)dst;
+    
+    // 简单的从前往后拷贝
+    while (n-- > 0)
+        *d++ = *s++;
+        
+    return dst;
+}
