@@ -132,3 +132,7 @@ void pmem_free(uint64 page, bool in_kernel)
 
     spinlock_release(&pool->lk);
 }
+void pmem_stat(uint32 *free_pages_in_kernel, uint32 *free_pages_in_user)
+{
+
+}

@@ -67,6 +67,7 @@ void uart_intr(void)
 		int c = uart_getc_sync();
 		if (c == -1)
 		break;
-		uart_putc_sync(c);
+
+		cons_edit(c);
 	}
 }
