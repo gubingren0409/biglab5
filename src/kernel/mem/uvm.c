@@ -355,31 +355,22 @@ void uvm_munmap(uint64 start, uint32 npages)
  * Part 3: 堆栈管理 (Heap & Stack)
  * ------------------------------------------------------------------------- */
 
-// 堆增长
-uint64 uvm_heap_grow(pgtbl_t tbl, uint64 current_top, uint32 bytes)
-{
-    if (bytes == 0) return current_top;
+uint64 uvm_heap_grow(pagetable_t pagetable, uint64 old_heap_top, uint64 new_heap_top, uint32 flag) {
+    if (new_heap_top <= old_heap_top) return old_heap_top;
     
-    uint64 new_top = current_top + bytes;
-    if (new_top > MMAP_BEGIN) return (uint64)-1; // 防止堆撞上 MMAP 区
-    
-    // 按页对齐进行分配
-    // 对齐后的当前页结束
-    uint64 page_aligned_curr = (current_top + PGSIZE - 1) & ~(PGSIZE - 1);
-    // 对齐后的新页结束
-    uint64 page_aligned_new = (new_top + PGSIZE - 1) & ~(PGSIZE - 1);
-    
-    for (uint64 va = page_aligned_curr; va < page_aligned_new; va += PGSIZE) {
-        void *mem = pmem_alloc(false);
-        if (!mem) {
-            // 回滚：释放已分配的
-            uvm_heap_ungrow(tbl, va, va - page_aligned_curr);
-            return (uint64)-1;
+    for (uint64 a = PG_ROUND_UP(old_heap_top); a < new_heap_top; a += PG_SIZE) {
+        void *mem = pmem_alloc();
+        if (mem == NULL) {
+            uvm_heap_shrink(pagetable, old_heap_top, a);
+            return old_heap_top;
         }
-        vm_mappages(tbl, va, (uint64)mem, PGSIZE, PTE_R | PTE_W | PTE_U);
+        if (mappages(pagetable, a, PG_SIZE, (uint64)mem, flag | PTE_U) != 0) {
+            pmem_free(mem);
+            uvm_heap_shrink(pagetable, old_heap_top, a);
+            return old_heap_top;
+        }
     }
-    
-    return new_top;
+    return new_heap_top;
 }
 
 // 堆收缩

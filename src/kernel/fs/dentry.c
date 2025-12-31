@@ -250,3 +250,162 @@ inode_t* path_to_parent_inode(char *path, char *name)
     
     return ip;
 }
+uint32 dentry_search_2(inode_t *ip, uint32 inode_num, char *name) {
+    dentry_t de;
+    for (uint32 off = 0; off < ip->size; off += sizeof(de)) {
+        if (inode_read(ip, (uint64)&de, off, sizeof(de), false) != sizeof(de))
+            return -1;
+        if (de.inode_num == inode_num) {
+            strncpy(name, de.name, N_NAME);
+            return off;
+        }
+    }
+    return -1;
+}
+
+// 传输有效目录项到用户/内核缓冲区 (用于 ls 命令)
+uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst) {
+    dentry_t de;
+    uint32 count = 0;
+    for (uint32 off = 0; off < ip->size && count + sizeof(de) <= len; off += sizeof(de)) {
+        inode_read(ip, (uint64)&de, off, sizeof(de), false);
+        if (de.inode_num != 0) {
+            if (either_copy_to(is_user_dst, dst + count, &de, sizeof(de)) < 0)
+                break;
+            count += sizeof(de);
+        }
+    }
+    return count;
+}
+
+// 获取 inode 的绝对路径（逆向回溯）
+uint32 inode_to_path(inode_t *ip, char *path, uint32 len) {
+    if (ip->type != INODE_DIRECTORY) return -1;
+    char buf[MAX_PATH];
+    int pos = MAX_PATH - 1;
+    buf[pos] = '\0';
+    
+    inode_t *curr = inode_dup(ip);
+    while (curr->inum != ROOT_INUM) {
+        inode_t *parent = __path_to_inode(curr, "..", false); // 获取父目录
+        if (!parent) { inode_put(curr); return -1; }
+        
+        char name[N_NAME];
+        dentry_search_2(parent, curr->inum, name);
+        int nlen = strlen(name);
+        pos -= nlen;
+        memmove(buf + pos, name, nlen);
+        pos--;
+        buf[pos] = '/';
+        
+        inode_put(curr);
+        curr = parent;
+    }
+    if (pos == MAX_PATH - 1) buf[--pos] = '/';
+    
+    uint32 final_len = MAX_PATH - 1 - pos;
+    if (final_len >= len) { inode_put(curr); return -1; }
+    memmove(path, buf + pos, final_len + 1);
+    inode_put(curr);
+    return 0;
+}
+
+// 创建新的 inode 并在路径下添加目录项
+inode_t* path_create_inode(char *path, uint16 type, uint16 major, uint16 minor) {
+    char name[N_NAME];
+    inode_t *dp = __path_to_inode(NULL, path, true); // 获取父目录
+    if (!dp) return NULL;
+    
+    __get_last_name(path, name);
+    acquire_sleeplock(&dp->lk);
+    if (dentry_search(dp, name, NULL) != -1) {
+        release_sleeplock(&dp->lk);
+        inode_put(dp);
+        return NULL;
+    }
+    
+    inode_t *ip = inode_alloc(type, major, minor);
+    if (!ip) { release_sleeplock(&dp->lk); inode_put(dp); return NULL; }
+    
+    acquire_sleeplock(&ip->lk);
+    ip->nlink = 1;
+    inode_update(ip);
+    
+    if (type == INODE_DIRECTORY) {
+        dentry_add(ip, ip->inum, ".");
+        dentry_add(ip, dp->inum, "..");
+        ip->nlink++; // 父目录引用
+        inode_update(ip);
+    }
+    
+    dentry_add(dp, ip->inum, name);
+    release_sleeplock(&ip->lk);
+    release_sleeplock(&dp->lk);
+    inode_put(dp);
+    return ip;
+}
+
+// 建立硬链接
+uint32 path_link(char *old_path, char *new_path) {
+    inode_t *ip = __path_to_inode(NULL, old_path, false);
+    if (!ip) return -1;
+    if (ip->type == INODE_DIRECTORY) { inode_put(ip); return -1; }
+    
+    char name[N_NAME];
+    inode_t *dp = __path_to_inode(NULL, new_path, true);
+    if (!dp) { inode_put(ip); return -1; }
+    
+    __get_last_name(new_path, name);
+    acquire_sleeplock(&dp->lk);
+    if (dentry_search(dp, name, NULL) != -1) {
+        release_sleeplock(&dp->lk);
+        inode_put(dp); inode_put(ip); return -1;
+    }
+    
+    dentry_add(dp, ip->inum, name);
+    acquire_sleeplock(&ip->lk);
+    ip->nlink++;
+    inode_update(ip);
+    release_sleeplock(&ip->lk);
+    
+    release_sleeplock(&dp->lk);
+    inode_put(dp);
+    inode_put(ip);
+    return 0;
+}
+
+// 解除链接
+uint32 path_unlink(char *path) {
+    char name[N_NAME];
+    inode_t *dp = __path_to_inode(NULL, path, true);
+    if (!dp) return -1;
+    
+    __get_last_name(path, name);
+    acquire_sleeplock(&dp->lk);
+    uint32 inum;
+    uint32 off = dentry_search(dp, name, &inum);
+    if (off == -1 || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        release_sleeplock(&dp->lk); inode_put(dp); return -1;
+    }
+    
+    inode_t *ip = inode_get(inum);
+    acquire_sleeplock(&ip->lk);
+    if (ip->nlink <= 0) panic("unlink nlink");
+    
+    dentry_t de; memset(&de, 0, sizeof(de));
+    inode_write(dp, (uint64)&de, off, sizeof(de), false);
+    
+    if (ip->type == INODE_DIRECTORY) {
+        dp->nlink--;
+        inode_update(dp);
+    }
+    
+    ip->nlink--;
+    inode_update(ip);
+    release_sleeplock(&ip->lk);
+    inode_put(ip);
+    
+    release_sleeplock(&dp->lk);
+    inode_put(dp);
+    return 0;
+}
