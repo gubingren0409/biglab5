@@ -238,10 +238,11 @@ static void proc_entry_point_updated()
     if (p->pid == 1) {
         fs_init();
         // LAB-9: 只有 PID 1 (init) 需要手动打开标准流
-        p->cwd = __path_to_inode(NULL, "/", false);
+        p->cwd = inode_get(ROOT_INODE);
         p->open_file[0] = file_open("/dev/stdin", O_RDONLY);
         p->open_file[1] = file_open("/dev/stdout", O_WRONLY);
         p->open_file[2] = file_open("/dev/stderr", O_WRONLY);
+        if(!p->open_file[1]) printf("Warning: stdout init failed!\n");
     }
 
     trap_user_return();

@@ -1,6 +1,14 @@
 #pragma once
 #include "../arch/type.h"
 #include "../lock/type.h"
+
+// 前置声明，避免循环引用
+struct inode;
+struct file;
+
+// 每个进程最大打开文件数
+#define N_OPEN_FILE 16
+
 // 同优先级的上下文
 typedef struct context
 {
@@ -25,21 +33,21 @@ typedef struct context
 // 跨优先级的上下文
 typedef struct trapframe
 {
-    /*   0 */ uint64 user_to_kern_satp;        // kernel page table
-    /*   8 */ uint64 user_to_kern_sp;          // top of process's kernel stack
-    /*  16 */ uint64 user_to_kern_trapvector;  // usertrap()
-    /*  24 */ uint64 user_to_kern_epc;         // saved user program counter
-    /*  32 */ uint64 user_to_kern_hartid;      // saved kernel tp
+    /* 0 */ uint64 user_to_kern_satp;        // kernel page table
+    /* 8 */ uint64 user_to_kern_sp;          // top of process's kernel stack
+    /* 16 */ uint64 user_to_kern_trapvector;  // usertrap()
+    /* 24 */ uint64 user_to_kern_epc;         // saved user program counter
+    /* 32 */ uint64 user_to_kern_hartid;      // saved kernel tp
 
     // 全部通用寄存器
-    /*  40 */ uint64 ra;
-    /*  48 */ uint64 sp;
-    /*  56 */ uint64 gp;
-    /*  64 */ uint64 tp;
-    /*  72 */ uint64 t0;
-    /*  80 */ uint64 t1;
-    /*  88 */ uint64 t2;
-    /*  96 */ uint64 s0;
+    /* 40 */ uint64 ra;
+    /* 48 */ uint64 sp;
+    /* 56 */ uint64 gp;
+    /* 64 */ uint64 tp;
+    /* 72 */ uint64 t0;
+    /* 80 */ uint64 t1;
+    /* 88 */ uint64 t2;
+    /* 96 */ uint64 s0;
     /* 104 */ uint64 s1;
     /* 112 */ uint64 a0;
     /* 120 */ uint64 a1;
@@ -69,17 +77,6 @@ typedef struct trapframe
 typedef uint64 *pgtbl_t;
 typedef struct mmap_region mmap_region_t;
 
-
-/*
-    可能的进程状态转换：
-    UNUSED -> RUNNABLE 进程初始化
-    RUNNABLE -> RUNNIGN 进程获得CPU使用权
-    RUNNING -> RUNNABLE 进程失去CPU使用权
-    RUNNING -> SLEEPING 进程睡眠
-    SLEEPING -> RUNNABLE 进程苏醒
-    RUNNING -> ZOMBIE 进程宣布退出
-    ZOMBIE -> UNUSED 进程被父进程回收
-*/
 enum proc_state
 {
     UNUSED,   // 未被使用
@@ -107,9 +104,12 @@ typedef struct proc
     mmap_region_t *mmap; // 用户态mmap区域
     trapframe_t *tf;     // 用户态内核态切换时的运行环境暂存空间
 
+    // Lab 9 新增字段
+    struct inode *cwd;           // 当前工作目录
+    struct file *open_file[N_OPEN_FILE]; // 打开的文件表
+
     uint64 kstack;       // 内核栈的虚拟地址
     context_t ctx;       // 内核态进程上下文
 } proc_t;
 
-// 系统中最多同时存在N_PROC个进程
 #define N_PROC 32

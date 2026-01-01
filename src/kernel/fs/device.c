@@ -1,125 +1,189 @@
 #include "mod.h"
+#include "type.h"          // [修复] 必须包含，定义了 device_t, INODE_MAJOR_*
+#include "../proc/mod.h"   // 引入 myproc
+#include "../mem/method.h" // 引入 pmem_alloc, uvm_copy, pmem_stat
+#include "../lib/method.h" // 引入 cons_read, cons_write, printf, memmove
 
-// 外部库函数声明 (通常由 console.c, uart.c 或其他 lib 提供)
-extern uint32 cons_read(uint64 dst, uint32 len, bool is_user);
-extern uint32 cons_write(uint64 src, uint32 len, bool is_user);
-extern void   cons_putc(char c);
-extern char   cons_getc(void);
-extern uint32 gpt_query(uint64 src, uint32 len, bool is_user);
+// 1. 补充缺失的宏定义，映射到 type.h 中的常量
+#define DEV_STDIN     INODE_MAJOR_STDIN
+#define DEV_STDOUT    INODE_MAJOR_STDOUT
+#define DEV_STDERR    INODE_MAJOR_STDERR
+#define DEV_ZERO      INODE_MAJOR_ZERO
+#define DEV_NULL      INODE_MAJOR_NULL
+#define DEV_GPT       INODE_MAJOR_GPT0
 
-/**
- * 设备初始化
- * 确保 /dev 目录下的设备文件在磁盘上存在
- * 这样用户程序才能通过 open("/dev/stdin", ...) 访问它们
- */
-void device_init() {
-    // 检查 /dev 目录，如果不存在 path_create_inode 会根据路径递归或报错
-    // 实际上 mkfs.c 在制作镜像时已经预置了这些 inode
-    // 这里主要确保内核对这些设备号有认知
+// 映射 Open Mode
+#define O_RDONLY      FILE_OPEN_READ
+#define O_WRONLY      FILE_OPEN_WRITE
+#define O_RDWR        (FILE_OPEN_READ | FILE_OPEN_WRITE)
+
+// 2. 实现辅助拷贝函数 (either_copy)
+static int either_copy_to(bool is_user, uint64 dst, void *src, uint32 len) {
+    if (is_user) {
+        uvm_copyout(myproc()->pgtbl, dst, (uint64)src, len);
+    } else {
+        memmove((void*)dst, src, len);
+    }
+    return 0;
 }
 
-/**
- * 检查设备打开权限的合法性
- */
-bool device_open_check(uint16 major, uint32 open_mode) {
+static int either_copy_from(bool is_user, void *dst, uint64 src, uint32 len) {
+    if (is_user) {
+        uvm_copyin(myproc()->pgtbl, (uint64)dst, src, len);
+    } else {
+        memmove(dst, (void*)src, len);
+    }
+    return 0;
+}
+
+device_t device_table[N_DEVICE];
+
+/* 标准输入设备 */
+static uint32 device_stdin_read(uint32 len, uint64 dst, bool is_user_dst)
+{
+    // 调用 lib/console.c 中的 cons_read (注意参数顺序: len, dst, flag)
+    return cons_read(len, dst, is_user_dst);
+}
+
+/* 标准输出设备 */
+static uint32 device_stdout_write(uint32 len, uint64 src, bool is_user_src)
+{
+    return cons_write(len, src, is_user_src);
+}
+
+/* 标准错误输出设备 */
+static uint32 device_stderr_write(uint32 len, uint64 src, bool is_user_src)
+{
+    printf("ERROR: ");
+    return cons_write(len, src, is_user_src);
+}
+
+/* 无限0流 (/dev/zero) */
+static uint32 device_zero_read(uint32 len, uint64 dst, bool is_user_dst)
+{
+    uint32 write_len = 0, cut_len = 0;
+    // 分配一个全0的物理页作为源
+    uint64 src = (uint64)pmem_alloc(true); 
+    if (!src) return 0;
+    memset((void*)src, 0, PGSIZE);
+
+    while (write_len < len)
+    {
+        cut_len = (len - write_len > PGSIZE) ? PGSIZE : (len - write_len);
+        
+        if (either_copy_to(is_user_dst, dst, (void*)src, cut_len) < 0) {
+            break;
+        }
+
+        dst += cut_len;
+        write_len += cut_len;
+    }
+
+    pmem_free(src, true);
+    return write_len;
+}
+
+/* 空设备读取 (/dev/null) */
+static uint32 device_null_read(uint32 len, uint64 dst, bool is_user_dst)
+{
+    return 0; // EOF
+}
+
+/* 空设备写入 (/dev/null) */
+static uint32 device_null_write(uint32 len, uint64 src, bool is_user_src)
+{
+    return len; // 丢弃所有数据，假装写入成功
+}
+
+/* 彩蛋: 笨蛋GPT */
+static uint32 device_gpt0_write(uint32 len, uint64 src, bool is_user_src)
+{
+    char tmp[MAXLEN_FILENAME + 1]; 
+    uint32 copy_len = (len > MAXLEN_FILENAME) ? MAXLEN_FILENAME : len;
+    proc_t *p = myproc();
+
+    if (either_copy_from(is_user_src, tmp, src, copy_len) < 0)
+        return 0;
+    
+    tmp[copy_len] = '\0';
+
+    if (strncmp(tmp, "Hello", copy_len) == 0) {
+        printf("Hi, I am gpt0!\n");
+    } else if (strncmp(tmp, "Guess who I am", copy_len) == 0) {
+        printf("Your procid is %d and name is %s.\n", p->pid, p->name);
+    } else if (strncmp(tmp, "How many free memory left", copy_len) == 0) {
+        uint32 kernel_free_pages, user_free_pages;
+        pmem_stat(&kernel_free_pages, &user_free_pages);
+        printf("We have %d free pages in kernel space, %d free pages in user space!\n",
+            kernel_free_pages, user_free_pages);
+    } else if (strncmp(tmp, "Good job", copy_len) == 0) {
+        printf("Thanks for your kind words!\n");
+    } else {
+        printf("Sorry, I can not understand it.\n");
+    }
+
+    return len;
+}
+
+/* 注册设备 */
+static void device_register(uint32 index, char* name,
+    uint32(*read)(uint32, uint64, bool),
+    uint32(*write)(uint32, uint64, bool))
+{
+    if (index >= N_DEVICE) return;
+    memmove(device_table[index].name, name, MAXLEN_FILENAME);
+    device_table[index].read = read;
+    device_table[index].write = write;
+}
+
+/* 初始化device_table */
+void device_init()
+{
+    // 清空表
+    memset(device_table, 0, sizeof(device_table));
+
+    // 注册所有设备
+    device_register(DEV_STDIN,  "stdin",  device_stdin_read,  NULL);
+    device_register(DEV_STDOUT, "stdout", NULL,               device_stdout_write);
+    device_register(DEV_STDERR, "stderr", NULL,               device_stderr_write);
+    device_register(DEV_ZERO,   "zero",   device_zero_read,   NULL);
+    device_register(DEV_NULL,   "null",   device_null_read,   device_null_write);
+    device_register(DEV_GPT,    "gpt0",   NULL,               device_gpt0_write);
+}
+
+/* 检查文件major字段的合法性及权限 */
+bool device_open_check(uint16 major, uint32 open_mode)
+{
+    if (major >= N_DEVICE) return false;
+
     switch (major) {
         case DEV_STDIN:
-            // 标准输入只能读
             return (open_mode == O_RDONLY);
         case DEV_STDOUT:
         case DEV_STDERR:
         case DEV_GPT:
-            // 标准输出、错误输出、GPT 只能写
             return (open_mode == O_WRONLY);
         case DEV_ZERO:
+            return (open_mode == O_RDONLY);
         case DEV_NULL:
-            // 零文件和黑洞文件读写均可
-            return true;
+            return true; // null 可读可写
         default:
             return false;
     }
 }
 
-/**
- * 设备读接口：将不同主设备号的操作重定向到具体的驱动函数
- */
-uint32 device_read_data(uint16 major, uint32 len, uint64 dst, bool is_user_dst) {
-    uint32 i;
-    char zero = 0;
-
-    switch (major) {
-        case DEV_STDIN:
-            // 从行缓冲控制台读取输入
-            return cons_read(dst, len, is_user_dst);
-
-        case DEV_ZERO:
-            // /dev/zero: 读到的永远是 0
-            for (i = 0; i < len; i++) {
-                if (either_copy_to(is_user_dst, dst + i, &zero, 1) < 0)
-                    return i;
-            }
-            return len;
-
-        case DEV_NULL:
-            // /dev/null: 读到的字节数永远是 0
-            return 0;
-
-        default:
-            return 0;
-    }
+/* 从设备文件中读取数据 */
+uint32 device_read_data(uint16 major, uint32 len, uint64 dst, bool is_user_dst)
+{
+    if (major >= N_DEVICE || !device_table[major].read)
+        return 0; // 不支持读取或设备不存在
+    return device_table[major].read(len, dst, is_user_dst);
 }
 
-/**
- * 设备写接口：将不同主设备号的操作重定向到具体的驱动函数
- */
-uint32 device_write_data(uint16 major, uint32 len, uint64 src, bool is_user_src) {
-    char c;
-    uint32 i;
-
-    switch (major) {
-        case DEV_STDOUT:
-            // 标准输出：直接打印到控制台
-            return cons_write(src, len, is_user_src);
-
-        case DEV_STDERR:
-            // 标准错误：增加 "ERROR: " 前缀后输出
-            printf("ERROR: ");
-            return cons_write(src, len, is_user_src);
-
-        case DEV_NULL:
-            // /dev/null: 黑洞，写入多少都认为成功，但不产生任何效果
-            return len;
-
-        case DEV_GPT:
-            // 小彩蛋：GPT 逻辑
-            return gpt_query(src, len, is_user_src);
-
-        default:
-            return 0;
-    }
-}
-
-// ------------------------------------------------------------------
-// 以下是简单的辅助函数，如果你的 console.c 已经实现了 cons_read/write，
-// 则 device_read_data 直接调用它们即可。
-// ------------------------------------------------------------------
-
-/**
- * 示例：简单的 stdin 读取实现 (如果没有 cons_read)
- */
-uint32 stdin_read(uint32 len, uint64 dst, bool is_user) {
-    return cons_read(dst, len, is_user);
-}
-
-/**
- * 示例：简单的 stdout 写入实现 (如果没有 cons_write)
- */
-uint32 stdout_write(uint32 len, uint64 src, bool is_user) {
-    char c;
-    for (uint32 i = 0; i < len; i++) {
-        if (either_copy_from(is_user, &c, src + i, 1) < 0)
-            return i;
-        cons_putc(c);
-    }
-    return len;
+/* 向设备文件写入数据 */
+uint32 device_write_data(uint16 major, uint32 len, uint64 src, bool is_user_src)
+{
+    if (major >= N_DEVICE || !device_table[major].write)
+        return 0; // 不支持写入或设备不存在
+    return device_table[major].write(len, src, is_user_src);
 }

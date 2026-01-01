@@ -57,8 +57,8 @@ int proc_exec(char *path, char **argv) {
     // Copy argc to a0, argv to a1 (simplified)
     int argc = 0; while(argv[argc]) argc++;
     p->trapframe->a0 = argc;
-    // p->trapframe->a1 = ... (pointer to argv on stack)
-
+    p->trapframe->a1 = sp;
+    
     kvm_free_pagetable(old_pagetable, true);
     return 0;
 
