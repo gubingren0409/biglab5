@@ -6,3 +6,4 @@
 #include "../lib/mod.h"   // 库函数 (printf, panic, memset)
 #include "../mem/mod.h"   // 内存管理 (pmem_alloc, pmem_free, vm_getpte)
 #include "../proc/mod.h"  // 进程管理 (proc_sleep, proc_wakeup - virtio.c需要)
+#include "../lib/mod.h"

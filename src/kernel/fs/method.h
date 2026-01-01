@@ -46,7 +46,8 @@ uint32 dentry_delete(inode_t *ip, char *name);
 void dentry_print(inode_t *ip);
 inode_t* path_to_inode(char *path);
 inode_t* path_to_parent_inode(char *path, char *name);
-
+inode_t* __path_to_inode(inode_t *cur, char *path, bool name_only); // 根据实际实现调整参数
+inode_t* path_create_inode(char *path, uint16 type, uint16 major, uint16 minor);
 /* fs.c: 文件系统 */
 
 void fs_init();

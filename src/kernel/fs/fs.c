@@ -1,5 +1,19 @@
 #include "mod.h"
 
+#define O_CREATE    FILE_OPEN_CREATE
+#define O_RDONLY    FILE_OPEN_READ
+#define O_WRONLY    FILE_OPEN_WRITE
+#define O_RDWR      (FILE_OPEN_READ | FILE_OPEN_WRITE)
+#define O_APPEND    0x08 // 假设的 APPEND 标志，如果 type.h 未定义可暂时设为 0 或自定义
+#define O_CREATE    FILE_OPEN_CREATE
+#define O_RDONLY    FILE_OPEN_READ
+#define O_WRONLY    FILE_OPEN_WRITE
+#define O_RDWR      (FILE_OPEN_READ | FILE_OPEN_WRITE)
+#define O_APPEND    0x08
+// 映射 Inode 类型
+#define INODE_FILE      INODE_TYPE_DATA
+#define INODE_DIRECTORY INODE_TYPE_DIR
+#define INODE_DEVICE    INODE_TYPE_DEVICE
 // 全局文件表：存放所有打开的文件对象
 file_t file_table[N_FILE];
 spinlock_t lk_file_table;
@@ -113,19 +127,19 @@ file_t* file_open(char *path, uint32 open_mode) {
 
     if (ip == NULL) return NULL;
 
-    acquire_sleeplock(&ip->lk);
+    acquire_sleeplock(&ip->slk);
 
     // 权限检查：目录不能以写方式打开
-    if (ip->type == INODE_DIRECTORY && (open_mode != O_RDONLY)) {
-        release_sleeplock(&ip->lk);
+    if (ip->disk_info.type == INODE_DIRECTORY && (open_mode != O_RDONLY)) {
+        release_sleeplock(&ip->slk);
         inode_put(ip);
         return NULL;
     }
 
     // 设备文件特有的打开检查
-    if (ip->type == INODE_DEVICE) {
-        if (!device_open_check(ip->major, open_mode)) {
-            release_sleeplock(&ip->lk);
+    if (ip->disk_info.type == INODE_DEVICE) {
+        if (!device_open_check(ip->disk_info.major, open_mode)) {
+            release_sleeplock(&ip->slk);
             inode_put(ip);
             return NULL;
         }
@@ -133,7 +147,7 @@ file_t* file_open(char *path, uint32 open_mode) {
 
     file_t *f = file_alloc();
     if (f == NULL) {
-        release_sleeplock(&ip->lk);
+        release_sleeplock(&ip->slk);
         inode_put(ip);
         return NULL;
     }
@@ -143,13 +157,13 @@ file_t* file_open(char *path, uint32 open_mode) {
     f->writable = (open_mode & O_WRONLY) || (open_mode & O_RDWR);
     
     // 处理追加模式
-    if ((open_mode & O_APPEND) && ip->type == INODE_FILE) {
-        f->offset = ip->size;
+    if ((open_mode & O_APPEND) && ip->disk_info.type == INODE_FILE) {
+        f->offset = ip->disk_info.size;
     } else {
         f->offset = 0;
     }
 
-    release_sleeplock(&ip->lk);
+    release_sleeplock(&ip->slk);
     return f;
 }
 
@@ -160,17 +174,17 @@ uint32 file_read(file_t* f, uint32 len, uint64 dst, bool is_user_dst) {
     if (!f->readable) return -1;
 
     uint32 bytes = 0;
-    if (f->ip->type == INODE_DEVICE) {
+    if (f->ip->disk_info.type == INODE_DEVICE) {
         // 分发到设备驱动 (device.c)
-        bytes = device_read_data(f->ip->major, len, dst, is_user_dst);
+        bytes = device_read_data(f->ip->disk_info.major, len, dst, is_user_dst);
     } else {
         // 普通文件或目录读
-        acquire_sleeplock(&f->ip->lk);
+        acquire_sleeplock(&f->ip->slk);
         bytes = inode_read(f->ip, dst, f->offset, len, is_user_dst);
         if (bytes > 0) {
             f->offset += bytes;
         }
-        release_sleeplock(&f->ip->lk);
+        release_sleeplock(&f->ip->slk);
     }
     return bytes;
 }
@@ -182,17 +196,17 @@ uint32 file_write(file_t* f, uint32 len, uint64 src, bool is_user_src) {
     if (!f->writable) return -1;
 
     uint32 bytes = 0;
-    if (f->ip->type == INODE_DEVICE) {
+    if (f->ip->disk_info.type == INODE_DEVICE) {
         // 分发到设备驱动 (device.c)
-        bytes = device_write_data(f->ip->major, len, src, is_user_src);
+        bytes = device_write_data(f->ip->disk_info.major, len, src, is_user_src);
     } else {
         // 普通文件写
-        acquire_sleeplock(&f->ip->lk);
+        acquire_sleeplock(&f->ip->slk);
         bytes = inode_write(f->ip, src, f->offset, len, is_user_src);
         if (bytes > 0) {
             f->offset += bytes;
         }
-        release_sleeplock(&f->ip->lk);
+        release_sleeplock(&f->ip->slk);
     }
     return bytes;
 }
@@ -201,7 +215,7 @@ uint32 file_write(file_t* f, uint32 len, uint64 src, bool is_user_src) {
  * 移动读写指针
  */
 uint32 file_lseek(file_t *f, uint32 lseek_offset, uint32 lseek_flag) {
-    acquire_sleeplock(&f->ip->lk);
+    acquire_sleeplock(&f->ip->slk);
     uint32 new_off = f->offset;
 
     switch (lseek_flag) {
@@ -212,16 +226,16 @@ uint32 file_lseek(file_t *f, uint32 lseek_offset, uint32 lseek_flag) {
             new_off += lseek_offset;
             break;
         case LSEEK_END:
-            new_off = f->ip->size + lseek_offset;
+            new_off = f->ip->disk_info.size + lseek_offset;
             break;
         default:
-            release_sleeplock(&f->ip->lk);
+            release_sleeplock(&f->ip->slk);
             return -1;
     }
 
     // 简单检查：offset 不能为负（uint32 保证了非负，但需要逻辑合理）
     f->offset = new_off;
-    release_sleeplock(&f->ip->lk);
+    release_sleeplock(&f->ip->slk);
     return new_off;
 }
 
@@ -230,12 +244,12 @@ uint32 file_lseek(file_t *f, uint32 lseek_offset, uint32 lseek_flag) {
  */
 uint32 file_get_stat(file_t* f, uint64 user_dst) {
     stat_t st;
-    acquire_sleeplock(&f->ip->lk);
+    acquire_sleeplock(&f->ip->slk);
     st.inum = f->ip->inum;
-    st.type = f->ip->type;
+    st.type = f->ip->disk_info.type;
     st.nlink = f->ip->nlink;
-    st.size = f->ip->size;
-    release_sleeplock(&f->ip->lk);
+    st.size = f->ip->disk_info.size;
+    release_sleeplock(&f->ip->slk);
     
     // 拷贝到用户态缓冲区
     if (either_copy_to(true, user_dst, &st, sizeof(st)) < 0)

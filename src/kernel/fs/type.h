@@ -1,6 +1,7 @@
 #pragma once
 #include "../arch/type.h"
 #include "../mem/type.h"
+#include "../lock/type.h" 
 
 /*----------------------关于磁盘----------------------*/
 
@@ -137,7 +138,7 @@ typedef struct super_block {
 /* type的可能取值 */
 #define INODE_TYPE_DATA      0               // inode管理无结构的流式数据
 #define INODE_TYPE_DIR       1               // inode管理结构化的目录数据
-#define INODE_TYPE_DIVICE    2               // inode对应虚拟设备(不管理数据)
+#define INODE_TYPE_DEVICE    2               // inode对应虚拟设备(不管理数据)
 
 /* major和minor的默认取值(代表磁盘设备) */
 #define INODE_MAJOR_DEFAULT   1              // 默认的主设备号
@@ -192,3 +193,44 @@ typedef struct dentry {
 #define INODE_PER_BLOCK (BLOCK_SIZE / sizeof(inode_disk_t))
 #define DENTRY_PER_BLOCK  (BLOCK_SIZE / sizeof(dentry_t))
 #define COUNT_BLOCKS(ele_num, ele_per_block)  (((ele_num) + (ele_per_block) - 1) / (ele_per_block)) 
+#define FILE_OPEN_READ      0x1
+#define FILE_OPEN_WRITE     0x2
+#define FILE_OPEN_CREATE    0x4
+
+/* 设备号定义 (映射 device.c 中的 DEV_*) */
+#define INODE_MAJOR_STDIN   0
+#define INODE_MAJOR_STDOUT  1
+#define INODE_MAJOR_STDERR  2
+#define INODE_MAJOR_ZERO    3
+#define INODE_MAJOR_NULL    4
+#define INODE_MAJOR_GPT0    5
+
+/* 系统支持的最大设备数 */
+#define N_DEVICE            10
+
+/* 设备结构体定义 */
+typedef struct device {
+    char name[MAXLEN_FILENAME];
+    // 读函数指针: 参数为 (长度, 目标地址, 目标是否为用户空间)
+    uint32 (*read)(uint32 len, uint64 dst, bool is_user_dst);
+    // 写函数指针: 参数为 (长度, 源地址, 源是否为用户空间)
+    uint32 (*write)(uint32 len, uint64 src, bool is_user_src);
+} device_t;
+typedef struct file {
+    inode_t *ip;        // 对应的inode
+    bool readable;      // 是否可读
+    bool writable;      // 是否可写 (注意修复了原版 writbale 的拼写错误)
+    uint32 offset;      // 读/写指针的偏移量
+    uint32 ref;         // 引用数 (lk_file_table保护)
+} file_t;
+
+#define N_FILE 128      // file_table中file的数量
+
+/* 文件状态结构体 */
+typedef struct file_stat {
+    uint16 type;        // inode_disk->type
+    uint16 nlink;       // inode_disk->nlink
+    uint32 size;        // inode_disk->size
+    uint32 inode_num;   // inode->inode_num
+    uint32 offset;      // file->offset
+} file_stat_t;
