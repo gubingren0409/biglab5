@@ -47,12 +47,22 @@ static int allocate_pid()
 // 进程初次运行的入口函数 (内核态 -> 用户态)
 static void proc_entry_point()
 {
+    proc_t *p = myproc();
     // 释放调度器切换过来时持有的进程锁
-    spinlock_release(&myproc()->lk);
+    spinlock_release(&p->lk);
 
     // [NEW] 如果是第一个进程(PID=1)，负责初始化文件系统
-    if (myproc()->pid == 1) {
+    if (p->pid == 1) {
         fs_init();
+        
+        // LAB-9: 只有 PID 1 (init) 需要手动打开标准流
+        // 因为它是所有其他进程的祖先，其他进程会通过 fork 继承这些文件描述符
+        p->cwd = inode_get(ROOT_INODE);
+        p->open_file[0] = file_open("/dev/stdin", O_RDONLY);
+        p->open_file[1] = file_open("/dev/stdout", O_WRONLY);
+        p->open_file[2] = file_open("/dev/stderr", O_WRONLY);
+        
+        if(!p->open_file[1]) printf("Warning: stdout init failed!\n");
     }
 
     // 返回用户空间
@@ -126,6 +136,7 @@ proc_t *proc_alloc()
     }
 
     memset(&p->ctx, 0, sizeof(p->ctx));
+    // 设置内核上下文的返回地址为 proc_entry_point
     p->ctx.ra = (uint64)proc_entry_point;
     p->ctx.sp = p->kstack + PGSIZE;
 
@@ -208,11 +219,7 @@ void proc_make_first()
     p->ustack_npage = 1;
     p->heap_top = USER_BASE + PGSIZE;
 
-    // LAB-9: 初始化 proczero 的文件系统上下文
-    // 注意：此时 fs_init 尚未运行，fs_init 会在 proc_entry_point 中被 PID 1 调用
-    // 但我们可以预设路径，等到进程真正开始运行并调用 fs_init 后，文件系统就可用了
-    // 这里的初始化放在 proc_entry_point 的 fs_init 之后更安全
-    // 所以我们在 proc_entry_point 的 fs_init() 后面补充逻辑 (见下方修改)
+    // 注意：文件系统的初始化推迟到 proc_entry_point 中进行
 
     p->tf->user_to_kern_epc = USER_BASE;
     p->tf->sp = TRAPFRAME;
@@ -228,26 +235,6 @@ void proc_make_first()
     p->state = RUNNABLE;
     spinlock_release(&p->lk);
 }
-
-// 修改 proc_entry_point 以支持 proczero 的文件初始化
-static void proc_entry_point_updated()
-{
-    proc_t *p = myproc();
-    spinlock_release(&p->lk);
-
-    if (p->pid == 1) {
-        fs_init();
-        // LAB-9: 只有 PID 1 (init) 需要手动打开标准流
-        p->cwd = inode_get(ROOT_INODE);
-        p->open_file[0] = file_open("/dev/stdin", O_RDONLY);
-        p->open_file[1] = file_open("/dev/stdout", O_WRONLY);
-        p->open_file[2] = file_open("/dev/stderr", O_WRONLY);
-        if(!p->open_file[1]) printf("Warning: stdout init failed!\n");
-    }
-
-    trap_user_return();
-}
-// 注意：请在 proc_alloc 中将 p->ctx.ra 指向 proc_entry_point (此处逻辑已整合)
 
 // 创建子进程 (Fork)
 int proc_fork()

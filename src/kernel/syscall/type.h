@@ -25,7 +25,24 @@
 #define SYS_show_buffer 20  // 输出buffer链表的状态
 #define SYS_flush_buffer 21 // 释放非活跃链表中buffer持有的物理内存资源 (测试buffer_freemem)
 
-#define SYS_MAX_NUM 21
+// [Lab 9] 新增文件系统调用
+#define SYS_open 22
+#define SYS_close 23
+#define SYS_read 24
+#define SYS_write 25
+#define SYS_lseek 26
+#define SYS_dup 27
+#define SYS_fstat 28
+#define SYS_get_dentries 29
+#define SYS_mkdir 30
+#define SYS_chdir 31
+#define SYS_print_cwd 32
+#define SYS_link 33
+#define SYS_unlink 34
+#define SYS_exec 35
+
+// [修复] 更新最大系统调用号
+#define SYS_MAX_NUM 35
 
 /* 可以传入的最大字符串长度 */
 #define STR_MAXLEN 127

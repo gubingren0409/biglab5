@@ -132,10 +132,23 @@ void pmem_free(uint64 page, bool in_kernel)
 
     spinlock_release(&pool->lk);
 }
-uint32 pmem_stat() {
-    uint32 n;
-    acquire_spinlock(&pmem.lk);
-    n = pmem.npage;
-    release_spinlock(&pmem.lk);
-    return n;
+
+/*
+ * [修复] 获取物理内存统计信息
+ * 必须与 method.h 中的声明一致: void pmem_stat(uint32*, uint32*)
+ */
+void pmem_stat(uint32 *free_pages_in_kernel, uint32 *free_pages_in_user) {
+    // 获取内核池统计
+    if (free_pages_in_kernel) {
+        spinlock_acquire(&kernel_pool.lk);
+        *free_pages_in_kernel = kernel_pool.allocable;
+        spinlock_release(&kernel_pool.lk);
+    }
+    
+    // 获取用户池统计
+    if (free_pages_in_user) {
+        spinlock_acquire(&user_pool.lk);
+        *free_pages_in_user = user_pool.allocable;
+        spinlock_release(&user_pool.lk);
+    }
 }

@@ -40,12 +40,14 @@ typedef struct super_block {
 /* type的可能取值 */
 #define INODE_TYPE_DATA      0               // inode管理无结构的流式数据
 #define INODE_TYPE_DIR       1               // inode管理结构化的目录数据
-#define INODE_TYPE_DIVICE    2               // inode对应虚拟设备(不管理数据)
+#define INODE_TYPE_DEVICE    2               // inode对应虚拟设备(不管理数据)
 
 /* major和minor的默认取值(代表磁盘设备) */
 #define INODE_MAJOR_DEFAULT   1              // 默认的主设备号
 #define INODE_MINOR_DEFAULT   1              // 默认的次设备号
-
+#define INODE_MAJOR_STDIN   0
+#define INODE_MAJOR_STDOUT  1
+#define INODE_MAJOR_STDERR  2
 /* index字段相关 */
 #define INODE_INDEX_1        (10)                 // 直接映射 (10个格子)
 #define INODE_INDEX_2        (10+2)               // 一级间接映射 (2个格子)
@@ -92,7 +94,7 @@ typedef struct dentry {
 
 // 文件系统常量定义
 #define BLOCK_SIZE       4096                 // 块的大小与页面大小保持一致
-#define N_DATA_BLOCK     (5 * 512 * 512)      // 数据区域设为 5GB
+#define N_DATA_BLOCK     (32 * 1024)      // 数据区域设为 5GB
 #define N_INODE          (1 << 16)            // 文件数量上限设为 65536个
 #define ROOT_INODE_NUM   0                    // 根目录的inode序号
 

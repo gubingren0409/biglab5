@@ -135,8 +135,6 @@ void uvm_show_mmaplist(mmap_region_t *head)
 }
 
 // 辅助函数：寻找一块足够大的虚拟地址空间
-// 如果找到，返回起始地址；否则返回 0
-// 输出参数 out_prev 指向新插入点的前驱节点
 static uint64 find_free_region(mmap_region_t *head, uint32 npages, mmap_region_t **out_prev)
 {
     uint64 req_len = npages * PGSIZE;
@@ -170,9 +168,6 @@ static uint64 find_free_region(mmap_region_t *head, uint32 npages, mmap_region_t
 
 /*
  * 建立新的内存映射
- * start: 建议起始地址 (0表示自动分配)
- * npages: 页面数量
- * perm: 权限标志
  */
 void uvm_mmap(uint64 start, uint32 npages, int perm)
 {
@@ -242,8 +237,6 @@ void uvm_mmap(uint64 start, uint32 npages, int perm)
             prev_node->npages += new_node->npages;
             prev_node->next = new_node->next;
             mmap_region_free(new_node);
-            // 如果发生了前向合并，new_node 实际上变成了 prev_node
-            // 但这里的逻辑已经结束，不需要更新 new_node 指针
         }
     }
     
@@ -261,8 +254,6 @@ void uvm_mmap(uint64 start, uint32 npages, int perm)
 
 /*
  * 解除内存映射
- * start: 起始地址
- * npages: 页面数量
  */
 void uvm_munmap(uint64 start, uint32 npages)
 {
@@ -279,9 +270,7 @@ void uvm_munmap(uint64 start, uint32 npages)
         uint64 region_end = walker->begin + walker->npages * PGSIZE;
         
         // 检查区间是否有交集
-        // 无交集的情况：请求区间在当前节点之前，或者在当前节点之后
         if (unmap_end <= walker->begin) {
-            // 因为链表有序，如果请求结束点在当前节点开始点之前，后续都不可能相交
             break; 
         }
         if (start >= region_end) {
@@ -299,53 +288,40 @@ void uvm_munmap(uint64 start, uint32 npages)
         vm_unmappages(p->pgtbl, overlap_start, overlap_len, true);
         
         // 2. 更新链表节点结构
-        // Case A: 完全覆盖 (Remove Node)
         if (start <= walker->begin && unmap_end >= region_end) {
+            // Case A: 完全覆盖 (Remove Node)
             mmap_region_t *victim = walker;
             if (prev) prev->next = walker->next;
             else p->mmap = walker->next;
             
-            walker = walker->next; // 移动到下一个，继续检查（虽然理论上只应有一个重叠，但为了健壮）
+            walker = walker->next; 
             mmap_region_free(victim);
-            continue; // prev 保持不变
+            continue; 
         }
-        
-        // Case B: 头部截断 (Trim Head) -> start <= begin < end < region_end
-        // 请求解映射的范围覆盖了节点的头部，但没覆盖尾部
         else if (start <= walker->begin && unmap_end < region_end) {
+            // Case B: 头部截断 (Trim Head)
             uint32 cut_pages = (unmap_end - walker->begin) / PGSIZE;
             walker->begin = unmap_end;
             walker->npages -= cut_pages;
-            // 处理完毕，无需继续，因为后续节点地址更高
             break;
         }
-        
-        // Case C: 尾部截断 (Trim Tail) -> begin < start < region_end <= end
-        // 请求解映射的范围覆盖了节点的尾部，但没覆盖头部
         else if (start > walker->begin && unmap_end >= region_end) {
+            // Case C: 尾部截断 (Trim Tail)
             uint32 cut_pages = (region_end - start) / PGSIZE;
             walker->npages -= cut_pages;
-            // 继续检查下一个节点（虽然一般只有这一个）
             prev = walker;
             walker = walker->next;
             continue; 
         }
-        
-        // Case D: 中间打洞 (Split) -> begin < start < end < region_end
-        // 请求范围完全在节点内部
         else {
-            // 分裂成两个节点：前部分 + 后部分
-            // 创建后半部分节点
+            // Case D: 中间打洞 (Split)
             mmap_region_t *new_node = mmap_region_alloc();
             new_node->begin = unmap_end;
             new_node->npages = (region_end - unmap_end) / PGSIZE;
             new_node->next = walker->next;
             
-            // 修改当前节点为前半部分
             walker->npages = (start - walker->begin) / PGSIZE;
             walker->next = new_node;
-            
-            // 打洞必定只影响这一个节点，处理完毕
             break;
         }
     }
@@ -355,21 +331,30 @@ void uvm_munmap(uint64 start, uint32 npages)
  * Part 3: 堆栈管理 (Heap & Stack)
  * ------------------------------------------------------------------------- */
 
-uint64 uvm_heap_grow(pagetable_t pagetable, uint64 old_heap_top, uint64 new_heap_top, uint32 flag) {
-    if (new_heap_top <= old_heap_top) return old_heap_top;
+/*
+ * [修复] 堆增长
+ */
+uint64 uvm_heap_grow(pgtbl_t pgtbl, uint64 cur_heap_top, uint32 len) 
+{
+    uint64 new_heap_top = cur_heap_top + len;
     
-    for (uint64 a = PG_ROUND_UP(old_heap_top); a < new_heap_top; a += PG_SIZE) {
-        void *mem = pmem_alloc();
+    // 从当前 top 向上对齐到页边界
+    uint64 a = (cur_heap_top + PGSIZE - 1) & ~(PGSIZE - 1);
+    
+    for (; a < new_heap_top; a += PGSIZE) {
+        // 分配用户页 (参数 false)
+        void *mem = pmem_alloc(false);
         if (mem == NULL) {
-            uvm_heap_shrink(pagetable, old_heap_top, a);
-            return old_heap_top;
+            // 分配失败，回滚操作（可选，这里简单返回0）
+            // 在实际系统中可能需要 unmap 之前分配的页
+            return 0; 
         }
-        if (mappages(pagetable, a, PG_SIZE, (uint64)mem, flag | PTE_U) != 0) {
-            pmem_free(mem);
-            uvm_heap_shrink(pagetable, old_heap_top, a);
-            return old_heap_top;
-        }
+        memset(mem, 0, PGSIZE);
+        
+        // 建立映射，堆通常是可读写的，且用户可访问
+        vm_mappages(pgtbl, a, (uint64)mem, PGSIZE, PTE_R | PTE_W | PTE_U);
     }
+    
     return new_heap_top;
 }
 
@@ -398,31 +383,20 @@ uint64 uvm_heap_ungrow(pgtbl_t tbl, uint64 current_top, uint32 bytes)
 // 用户栈自动增长 (Handle Page Fault)
 uint64 uvm_ustack_grow(pgtbl_t tbl, uint64 current_pages, uint64 fault_addr)
 {
-    // 合法性检查：
-    // 1. 栈向下增长，fault_addr 必须在当前栈底之下
-    // 2. 不能越界进入 MMAP 区域
-    // 3. 不能高于 TRAPFRAME (那是栈顶)
-    
     if (fault_addr >= TRAPFRAME) return (uint64)-1;
     if (fault_addr < MMAP_END) return (uint64)-1;
     
     uint64 current_bottom = TRAPFRAME - current_pages * PGSIZE;
     
-    // 如果 fault_addr 在已分配范围内，说明不是缺页（可能是权限错误等），直接返回
     if (fault_addr >= current_bottom) return current_pages;
     
-    // 计算需要扩展到的新边界 (向下取整到页边界)
     uint64 target_bottom = fault_addr & ~(PGSIZE - 1);
-    
-    // 计算需要新增的页数
     uint32 pages_needed = (current_bottom - target_bottom) / PGSIZE;
     
-    // 逐页分配
     for (int i = 0; i < pages_needed; i++) {
         uint64 va = current_bottom - (i + 1) * PGSIZE;
         void *mem = pmem_alloc(false);
         if (!mem) {
-            // 分配失败，回滚（释放刚刚分配的）
             if (i > 0) {
                 vm_unmappages(tbl, va + PGSIZE, i * PGSIZE, true);
             }
@@ -451,7 +425,6 @@ static void free_pagetable_recursive(pgtbl_t tbl, int level)
                 free_pagetable_recursive((pgtbl_t)child_pa, level - 1);
             } else {
                 // 叶子层：如果是用户页 (PTE_U)，则释放物理内存
-                // 内核共享页 (如 trampoline) 不释放
                 if (pte & PTE_U) {
                     pmem_free(child_pa, false);
                 }
@@ -465,14 +438,6 @@ static void free_pagetable_recursive(pgtbl_t tbl, int level)
 // 销毁进程页表
 void uvm_destroy_pgtbl(pgtbl_t tbl)
 {
-    // 解除特殊区域映射，防止递归函数误删共享页
-    // Trapframe 是进程私有的，应该被释放吗？
-    // 在 proc_free 中我们手动释放了 tf 的物理页，并仅仅是 unmap。
-    // 这里为了安全，我们在 destroy 前确保这些映射已被解除，
-    // 或者依靠 free_pagetable_recursive 中的 PTE_U 检查。
-    // 由于 Trapframe 和 Trampoline 都没有 PTE_U 标志，所以它们不会在递归中被释放，这是正确的。
-    // 只有页表结构本身会被释放。
-    
     free_pagetable_recursive(tbl, 2); // SV39 顶层为 level 2
 }
 

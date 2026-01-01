@@ -69,9 +69,9 @@ void printf(const char *fmt, ...)
         panic("printf: null format string");
 
     // 检查是否已经持有锁
-    // 如果由 panic 调用，可能已经持有锁，此时不再重复获取以避免死锁
-    if (!spinlock_holding(&print_lock)) {
-        spinlock_acquire(&print_lock);
+    // [修复] print_lock -> print_lk
+    if (!spinlock_holding(&print_lk)) {
+        spinlock_acquire(&print_lk);
         locking = 1;
     }
 
@@ -86,13 +86,16 @@ void printf(const char *fmt, ...)
             break;
         switch (c) {
         case 'd':
-            print_integer(va_arg(ap, int), 10, 1);
+            // [修复] print_integer -> printint
+            printint(va_arg(ap, int), 10, 1);
             break;
         case 'x':
-            print_integer(va_arg(ap, uint32), 16, 0);
+            // [修复] print_integer -> printint
+            printint(va_arg(ap, uint32), 16, 0);
             break;
         case 'p':
-            print_pointer(va_arg(ap, uint64));
+            // [修复] print_pointer -> printptr
+            printptr(va_arg(ap, uint64));
             break;
         case 'c':
             uart_putc_sync(va_arg(ap, int));
@@ -115,11 +118,10 @@ void printf(const char *fmt, ...)
     }
     va_end(ap);
 
+    // [修复] print_lock -> print_lk
     if (locking)
-        spinlock_release(&print_lock);
+        spinlock_release(&print_lk);
 }
-
-
 
 /* 如果发生panic, UART的停止标志 */
 volatile int panicked = 0;

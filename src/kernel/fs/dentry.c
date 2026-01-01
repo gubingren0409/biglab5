@@ -9,15 +9,14 @@
 #define INODE_DIRECTORY INODE_TYPE_DIR
 #define ROOT_INUM       ROOT_INODE
 
-// 1. 手动实现 strcpy，避免 implicit declaration
+// 手动实现 strcpy
 static char* strcpy(char *s, const char *t) {
     char *os = s;
     while ((*s++ = *t++) != 0);
     return os;
 }
 
-// 2. 手动实现 either_copy_to
-// 这是一个辅助函数，根据目标是在用户态还是内核态选择拷贝方式
+// 手动实现 either_copy_to
 static int either_copy_to(bool is_user, uint64 dst, void *src, uint32 len) {
     if (is_user) {
         uvm_copyout(myproc()->pgtbl, dst, (uint64)src, len);
@@ -121,7 +120,7 @@ void dentry_print(inode_t *ip) {
     }
 }
 
-// --- 路径解析与增强功能 ---
+// --- 路径解析 ---
 
 inode_t* path_to_inode(char *path) {
     char name[MAXLEN_FILENAME];
@@ -156,6 +155,13 @@ inode_t* path_to_inode(char *path) {
         ip = next_ip;
     }
     return ip;
+}
+
+// [修复] 添加 __path_to_inode 实现 (兼容 fs.c 和 exec.c 的调用)
+inode_t* __path_to_inode(inode_t *cur, char *path, bool name_only) {
+    // 我们的实现中忽略 cur (通常为NULL) 和 name_only (通常为false)
+    // 直接复用 path_to_inode，它已经处理了绝对路径(/)和相对路径(cwd)
+    return path_to_inode(path);
 }
 
 inode_t* path_to_parent_inode(char *path, char *name) {
@@ -203,19 +209,7 @@ inode_t* path_to_parent_inode(char *path, char *name) {
     return ip;
 }
 
-uint32 dentry_search_2(inode_t *ip, uint32 inode_num, char *name) {
-    dentry_t de;
-    for (uint32 off = 0; off < ip->disk_info.size; off += sizeof(de)) {
-        if (inode_read_data(ip, off, sizeof(de), &de, false) != sizeof(de))
-            return -1;
-        if (de.inode_num == inode_num) {
-            memmove(name, de.name, N_NAME);
-            return off;
-        }
-    }
-    return -1;
-}
-
+// 辅助：用于 sys_get_dentries 的传输函数
 uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst) {
     dentry_t de;
     uint32 count = 0;
@@ -228,6 +222,20 @@ uint32 dentry_transmit(inode_t *ip, uint64 dst, uint32 len, bool is_user_dst) {
         }
     }
     return count;
+}
+
+// 辅助：内部搜索 V2
+static uint32 dentry_search_2(inode_t *ip, uint32 inode_num, char *name) {
+    dentry_t de;
+    for (uint32 off = 0; off < ip->disk_info.size; off += sizeof(de)) {
+        if (inode_read_data(ip, off, sizeof(de), &de, false) != sizeof(de))
+            return -1;
+        if (de.inode_num == inode_num) {
+            memmove(name, de.name, N_NAME);
+            return off;
+        }
+    }
+    return -1;
 }
 
 uint32 inode_to_path(inode_t *ip, char *path, uint32 len) {
@@ -278,12 +286,12 @@ inode_t* path_create_inode(char *path, uint16 type, uint16 major, uint16 minor) 
     
     inode_lock(ip);
     ip->disk_info.nlink = 1;
-    inode_rw(ip, true); // 写入磁盘
+    inode_rw(ip, true);
     
     if (type == INODE_DIRECTORY) {
         dentry_create(ip, ip->inode_num, ".");
         dentry_create(ip, dp->inode_num, "..");
-        ip->disk_info.nlink++; // 父目录引用
+        ip->disk_info.nlink++;
         inode_rw(ip, true);
     }
     
@@ -328,7 +336,6 @@ uint32 path_unlink(char *path) {
     if (!dp) return -1;
     
     inode_lock(dp);
-    // 注意：不能删除 . 和 ..
     if (strncmp(name, ".", N_NAME) == 0 || strncmp(name, "..", N_NAME) == 0) {
         inode_unlock(dp); inode_put(dp); return -1;
     }

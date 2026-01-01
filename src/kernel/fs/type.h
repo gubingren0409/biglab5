@@ -234,3 +234,14 @@ typedef struct file_stat {
     uint32 inode_num;   // inode->inode_num
     uint32 offset;      // file->offset
 } file_stat_t;
+#define FILE_OPEN_READ      0x1
+#define FILE_OPEN_WRITE     0x2
+#define FILE_OPEN_CREATE    0x4
+#define O_RDONLY    FILE_OPEN_READ
+#define O_WRONLY    FILE_OPEN_WRITE
+#define O_RDWR      (FILE_OPEN_READ | FILE_OPEN_WRITE)
+#define O_CREATE    FILE_OPEN_CREATE
+// [新增] LSEEK 宏定义
+#define LSEEK_SET 0
+#define LSEEK_CUR 1
+#define LSEEK_END 2
